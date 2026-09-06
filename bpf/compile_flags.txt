@@ -1,0 +1,7 @@
+-xc
+-target
+bpf
+-D__TARGET_ARCH_x86
+-g
+-O2
+-I.
