@@ -91,7 +91,8 @@ reviewer-7  (declared: code-reviewer)
   KARYOTYPE:   loci=11  roots={WS,TMP}  mounts=1  depth≈D2–D3  repeat_frac .93
 ```
 
-Roughly 3,000 opens became about ten lines. The four tracks:
+Roughly 3,000 opens became about ten lines. The four tracks (§14.3 adds a
+fifth, for process startup):
 
 | track | holds | size |
 |---|---|---|
@@ -194,7 +195,8 @@ Properties this buys:
 
 - **Bounded memory per identity by construction** — K loci + fixed counters,
   regardless of behavior, including behavior designed to blow the budget.
-- **The flip is the classifier** — only a broad scanner trips it. Storage mode,
+- **The flip is the classifier** — only a broad scanner trips it (given that
+  startup traffic is kept out of the budget, §14.3). Storage mode,
   classification, and enforcement strategy become the same switch: bounded
   agents get confined by rules, broad agents get watched by shape.
 - **The attacker's flood becomes the attacker's classification.** The incentive
@@ -373,6 +375,8 @@ encoding composition rather than thresholds.
 | 6 | sealed germline | learning has an end; shadow never learns | 2 (poisoning) |
 | 7 | marker gate | theft invisible in composition, caught before similarity math | 2 |
 | 8 | species calling | "who is it" for a process with no label | 2 |
+| 14.1 | lineage cookie | a whole process tree is one chromosome; fork-only children cannot escape | 2 (closure) |
+| 14.3 | ontogeny track | loader and import traffic cannot trip aneuploidy or skew distance | 1, 2 |
 
 ---
 
@@ -386,6 +390,9 @@ encoding composition rather than thresholds.
 | behave so as to define your own "workspace" | for `role: NONE`, WS is unresolvable |
 | go slow, widen the baseline gradually | there is no baseline to widen: shadow profiles are never germline, and sealed germlines accept no new genes |
 | rename `.env` to `notes.txt` | the barcode inode-map still fires; nameclass is a bias term, not a security control — the doc must say so |
+| fork without exec, do the reading in the child | admission is at fork (§14.1); the child carries the root's cookie before it runs |
+| fork-bomb helpers so the tree's startup drowns the profile | startup lands on the bounded `ONTOGENY` track and is deduped per image (§14.3); the spectrum and the K budget never see it |
+| hide a credential read inside the post-exec window | markers and lethals are checked before the window (§14.3) |
 
 ---
 
@@ -407,6 +414,8 @@ Every property above stands with the metaphor stripped:
 | species / centroid / phylum | nearest-role classification by histogram distance; "no close match" |
 | phenotype | a policy-free shape label read off the tracks |
 | transcript | a per-identity ring of recent leaf events, flushed on alert |
+| lineage / cookie | the process tree under a registered root, keyed by an identity id that outlives the root pid |
+| ontogeny | a process's post-exec loader and import opens, kept on their own bounded track |
 
 Where the biology *contributed* rather than *named*: composition-over-sequence
 identification (metagenomic binning → species calling), marker-locus barcoding
@@ -446,11 +455,176 @@ identities without a purpose string.
 
 ---
 
-## 14. Open decisions
+## 14. Lineage — one chromosome per process tree
+
+The reviewer is not one process. Its runtime forks `git`, forks a `python3`
+that imports forty modules, and that `python3` forks a worker pool. Which of
+those is `reviewer-7`?
+
+```
+pid 4100  reviewer-7 runtime                        ← registered
+  └─ pid 4117  bash -c 'git diff | python3 lint.py'
+       ├─ pid 4118  git
+       └─ pid 4119  python3
+            └─ pid 4123  python3   (forked worker, never execs)
+```
+
+All of them. The chromosome is per **identity**, and the identity is the
+tree rooted at the registered process. Two rules make that hold, and a third
+keeps the tree's startup traffic from rewriting the profile.
+
+### 14.1 Admission is at fork; attribution is to the root
+
+A process joins the tracked set at `sched_process_fork`, before it ever
+runs, by copying its parent's entry. What it copies is a **cookie** — the
+identity of the root, allocated at registration.
+
+Two kernel maps, holding state of different scope:
+
+| map | key | value | scope |
+|---|---|---|---|
+| `roots` | cookie (u64) | root pid, start time, live count; later the K budget and aneuploid flag | one row per identity |
+| `tracked` | pid (u32) | cookie, exec generation, exec timestamp, opens since exec | one row per process in the tree |
+
+```
+register 4100    →  cookie C1;  roots[C1] = {pid 4100, live 1};  tracked[4100] = {C1}
+fork 4100→4117   →  tracked[4117] = {C1};  roots[C1].live++         no walk up the tree
+fork 4119→4123   →  tracked[4123] = {C1}                             any depth, one lookup
+open by 4123     →  tracked[4123].cookie = C1  →  reviewer-7's chromosome
+exit 4100        →  tracked[4100] deleted;  roots[C1] survives      children still attribute to C1
+live reaches 0   →  identity ended
+```
+
+The root pid itself sits in `tracked` like any descendant, so the hot path is
+one lookup for every open, root or child.
+
+The root's row must outlive the root pid. A runtime that daemonizes or
+crashes while its workers live on is still one identity, and the kernel will
+hand pid 4100 to something unrelated. **The cookie is the identity; the pid
+is a label.**
+
+Admission must be at **fork, not exec**. Tracking has to be a closure over
+the process tree, not the exec tree, or it is not a security boundary:
+
+```
+bash:  fork  →  child opens /tmp/out.txt  W  →  child execve md5sum
+```
+
+A shell redirection is opened by the child *between* fork and exec. So is
+every subshell, every `$(...)`, every pipeline stage that runs a builtin, and
+every forked worker — pid 4123 above never execs at all. The evasion is one
+line: `os.fork()`, read the secret in the child, exit. With admission at
+exec, none of those opens exist.
+
+### 14.2 Exec is a phase boundary, not an admission point
+
+`sched_process_exec` fires at the end of `exec_binprm()`: after the kernel
+has opened the binary and its ELF interpreter, before the process returns to
+user space. It changes no membership. It records the image and starts a new
+**generation** in the process's `tracked` row, which is what §14.3 needs.
+
+What sits on each side of that line decides what an exec hook can filter:
+
+```
+kernel, before the tracepoint:   open /usr/bin/python3               (open_exec)
+                                 open /lib64/ld-linux-x86-64.so.2     (PT_INTERP)
+user space, after:               open /etc/ld.so.cache
+                                 open /lib/x86_64-linux-gnu/libc.so.6
+                                 open /usr/lib/python3.12/encodings/__init__.py
+                                 … and every import that follows
+```
+
+Admitting at exec would remove exactly two opens per exec and leave the
+loader and the imports untouched. It does not reduce noise. The image itself
+is better taken from the tracepoint's `bprm` than from the open in any case.
+
+### 14.3 Ontogeny — a process's startup is not its behaviour
+
+Every exec'd descendant brings its own startup: loader, libraries, locale,
+imports. Measured on one host (`strace -e openat`; loci = distinct parent
+directories):
+
+| child | opens | loci |
+|---|---|---|
+| `bash -c true`, `dd`, `md5sum` | 4 | 3 |
+| `python3 -c pass` | 32 | 20 |
+| `python3 -c "import json, urllib.request, ssl, sqlite3, email, http.client"` | 124 | 31 |
+
+This is bounded in the goal-1 sense — a closed alphabet cannot overflow — but
+it corrupts two properties earlier sections rely on:
+
+- **Aneuploidy misfires (§5).** A bare interpreter with a few stdlib imports
+  burns 31 loci, half a K=64 budget, before the agent has done anything. An
+  agent importing an LLM SDK and an HTTP stack blows K at `import` and is
+  stamped `BROAD_SCANNER` — permanently, since the flip is sticky. "Only a
+  broad scanner trips it" is then false.
+- **Distance measures spawn style, not role (§8, §13).** A shell-driven
+  reviewer forking `dd | md5sum | awk` per file produces one behavioural open
+  and about twelve loader opens each time; over 90% of its spectrum mass is
+  `USR:*:R:BIN` and `ETC:D1:R:CFG`. It lands far from an in-process Python
+  reviewer for reasons that have nothing to do with the job — intra-role
+  variance of exactly the kind §13 says must stay small.
+
+Dropping these opens is wrong too. *Which image was executed* is among the
+best facts available: a "startup" that reads a binary from `TMP`, `HOME`,
+`/dev/shm` or the workspace is the dropped-payload case, and an image first
+exec'd after the seal is a novel allele. And a suppression built as a path
+allowlist would violate the iron rule.
+
+So startup gets its own compartment. Four bounded mechanisms, all O(1), none
+a path list:
+
+1. **A window opens at exec.** From `tracked[pid]`: the first N opens or the
+   first T ms of the current exec generation (N≈128, T≈100 ms; set from
+   traces).
+2. **Inside the window, an open is *ontogenic* iff its codon is in a small
+   static startup set** — loader roots, verb `R`, nameclass `BIN`/`CFG`/`OTHER`
+   under `USR`/`ETC`. The window says *when*, the codon says *what*. An open
+   in the window that fails the codon test is ordinary behaviour.
+3. **Ontogenic opens go to a fifth fixed-size track, `ONTOGENY`**: the set
+   of exec'd images (recorded exactly, marker-style, when the image is outside
+   standard roots) and a small startup-codon histogram. It adds no mass to the
+   spectrum and consumes no expressed-gene budget, so it cannot trip
+   aneuploidy. It remains comparable across the fleet — `bash+coreutils` vs
+   `python+torch` is a phenotype — and it gets its own novel-allele check
+   after the seal.
+4. **Dedup by image, not by exec.** A per-identity `(image inode) → count`
+   set: the first exec of an image is recorded in full, the forty-thousandth
+   `md5sum` increments a counter. A per-file scanner becomes two lines:
+   `exec md5sum ×N`, `exec dd ×N`. §1's "mass++, no new row", applied to
+   execs.
+
+**The invariant that must survive:** markers and lethals are checked
+*first*, before any window logic, exactly as in §3 and §5. A read of
+`~/.ssh/id_ed25519` three milliseconds after exec is not startup. Markers are
+inode-keyed (§11), so that check needs no path — which means ontogenic opens
+can skip `bpf_d_path` entirely. On a fork-per-file agent that is most of the
+hot-path CPU.
+
+### 14.4 What lands where
+
+| event | track |
+|---|---|
+| root or descendant opens a workspace file | spectrum / expressed — the agent's behaviour, whoever in the tree did it |
+| descendant's loader and imports, inside the window | `ONTOGENY` |
+| image exec'd from a non-standard root | `ONTOGENY`, exact record |
+| image first exec'd after the seal | novel allele |
+| marker or lethal locus, any time, any pid in the tree | marker track, gate first |
+
+The rule for descendants is the same as for the root: a shell agent forking
+`dd` to read repo files *is* the agent reading repo files. Only startup is
+separated.
+
+---
+
+## 15. Open decisions
 
 | decision | current lean |
 |---|---|
-| identity key composition | `(image, cgroup, role, MCP id)` — pin first; everything keys on it |
+| identity key composition | `(image, cgroup, role, MCP id)` — pin first; everything keys on it. In-kernel the identity is the root cookie (§14.1); descendants attribute to it rather than minting their own |
+| registering a pid already inside a tracked tree | refuse (`-EEXIST`) unless forced; a forced re-root gives the pid a new cookie and leaves already-forked children on the old one |
+| ontogeny window N, T | ≈128 opens / ≈100 ms; set from fleet traces of interpreter startup |
+| startup codon set | static: loader roots, verb `R`, nameclass `BIN`/`CFG`/`OTHER` under `USR`/`ETC`; closed like the alphabet, never a path list |
 | budget K (≡ scanner threshold) | percentile in the gap between bounded and scanner clusters, from fleet data |
 | fold boundary | static mount-roots; sizable and comparable |
 | nameclass alphabet | explicit, small, closed list with stated fallback; documented as a bias term |
@@ -463,7 +637,7 @@ identities without a purpose string.
 
 ---
 
-## 15. What this document does not cover
+## 16. What this document does not cover
 
 - **Stage 1** — whether a process is AI at all. The genome classifies what an
   AI process *does*; discovery is upstream.
