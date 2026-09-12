@@ -12,14 +12,6 @@ volatile u32 mon_iter_root_pid = 0;
 
 #define MAX_DEPTH 16
 
-struct {
-    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-    __type(key, u32);
-    __type(value, task_ctx_t);
-} task_ctx_map SEC(".maps");
-
-
 static __always_inline int depth_below(struct task_struct *t, u32 root_pid, struct task_struct **root)
 {
     struct task_struct *cur = t;
@@ -87,21 +79,8 @@ int BPF_PROG(mon_proc_fork, struct task_struct *parent, struct task_struct *chil
         }
     }
 
-    // A new thread shares the tgid, which is already in the map.
-    if (is_thread)
-        return 0;
-
-    if (!bpf_map_lookup_elem(&tracked_pids, &parent_pid))
-        return 0;
-
-    u8 val = 1;
-    long err = bpf_map_update_elem(&tracked_pids, &child_pid, &val, BPF_ANY);
-    if (err < 0) {
-        log_warn("proc_fork: pid=%u parent=%u not tracked: map full", child_pid, parent_pid);
-        return 0;
-    }
-
     log_debug("proc_fork: pid=%u inherited tracking from parent=%u", child_pid, parent_pid);
+
     return 0;
 }
 
@@ -137,76 +116,6 @@ int BPF_PROG(mon_proc_exit, struct task_struct *task, bool group_dead)
 
     u32 pid = task->tgid;
 
-    if (bpf_map_delete_elem(&tracked_pids, &pid) == 0)
-        log_debug("proc_exit: pid=%u removed from tracked_pids", pid);
-
-    return 0;
-}
-
-extern struct task_struct *bpf_task_from_pid(s32 pid) __ksym;
-extern void bpf_task_release(struct task_struct *p) __ksym;
-
-SEC("syscall")
-int mon_track_pid(struct mon_track_req *req)
-{
-    if (!req)
-        return -22; // -EINVAL
-
-    u32 pid = req->pid;
-    struct task_struct *task = bpf_task_from_pid((s32)pid);
-    if (!task)
-        return -3; // -ESRCH
-
-    pid_t task_pid = BPF_CORE_READ(task, pid);
-    pid_t task_tgid = BPF_CORE_READ(task, tgid);
-    if (task_pid != task_tgid) {
-        bpf_task_release(task);
-        return -22; // -EINVAL, tid given
-    }
-
-    u8 val = 1;
-    long err = bpf_map_update_elem(&tracked_pids, &pid, &val, BPF_ANY);
-    if (err < 0) {
-        bpf_task_release(task);
-        return (int)err;
-    }
-
-    // Check liveness only *after* the insert, so it cannot race with the
-    // exit path. On the exiting side the last thread decrements
-    // signal->live and later reaches trace_sched_process_exit, where
-    // mon_proc_exit deletes the entry. Both map ops take the same bucket
-    // lock, so whichever lands first: if their delete came first, the
-    // decrement is visible to the read below and we undo our insert; if our
-    // insert came first, their delete removes it. A check-before-insert
-    // would leave a window where a dead PID stays tracked until the kernel
-    // reuses it for an unrelated process.
-    //
-    // signal->live rather than PF_EXITING: a group leader that called
-    // pthread_exit() carries PF_EXITING while its other threads are still
-    // running, and that group is perfectly trackable.
-    int live = BPF_CORE_READ(task, signal, live.counter);
-    bpf_task_release(task);
-    if (live <= 0) {
-        bpf_map_delete_elem(&tracked_pids, &pid);
-        return -3; // -ESRCH
-    }
-
-    log_info("track_pid: pid=%u added to tracked_pids", pid);
-    return 0;
-}
-
-SEC("syscall")
-int mon_untrack_pid(struct mon_track_req *req)
-{
-    if (!req)
-        return -22; // -EINVAL
-
-    u32 pid = req->pid;
-    long err = bpf_map_delete_elem(&tracked_pids, &pid);
-    if (err < 0)
-        return (int)err;
-
-    log_info("untrack_pid: pid=%u removed from tracked_pids", pid);
     return 0;
 }
 

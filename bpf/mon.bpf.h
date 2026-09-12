@@ -4,10 +4,6 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
-struct mon_track_req {
-    u32 pid;
-};
-
 typedef struct root_id {
     u32 id;
     u64 starttime;
@@ -22,10 +18,10 @@ typedef struct task_ctx {
 
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
+    __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, u32);
-    __type(value, u8);
-} tracked_pids SEC(".maps");
+    __type(value, task_ctx_t);
+} task_ctx_map SEC(".maps");
 
 #endif // MON_BPF_H

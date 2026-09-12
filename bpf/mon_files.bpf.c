@@ -32,7 +32,11 @@ int BPF_PROG(mon_files_open, struct file *file)
 
     u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-    if (!bpf_map_lookup_elem(&tracked_pids, &pid))
+    // Skip untracked tasks. bpf_task_storage_get needs a BTF-typed task
+    // pointer; bpf_get_current_task() returns a plain scalar the verifier
+    // rejects, so use the _btf variant.
+    struct task_struct *task = bpf_get_current_task_btf();
+    if (!bpf_task_storage_get(&task_ctx_map, task, NULL, 0))
         return AIDR_RET(0);
 
     // bpf_d_path only accepts a trusted struct path *; &file->f_path from an
