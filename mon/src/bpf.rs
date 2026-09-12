@@ -3,9 +3,7 @@ use std::os::fd::AsFd;
 
 use anyhow::{Context, Result};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{
-    IterOpts, Link, Object, OpenObject, ProgramAttachType, ProgramInput, ProgramType,
-};
+use libbpf_rs::{IterOpts, Link, Object, OpenObject, ProgramAttachType, ProgramType};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -14,7 +12,7 @@ use crate::mon_procs_skel::{MonProcsSkel, MonProcsSkelBuilder};
 
 pub struct Bpf {
     /// Own the loaded BPF objects; held so the programs stay loaded for as
-    /// long as `Bpf` lives. `tracked_pids` is created by `files` and shared
+    /// long as `Bpf` lives. `task_ctx_map` is created by `files` and shared
     /// with `procs` via fd reuse.
     pub files: MonFilesSkel<'static>,
     pub procs: MonProcsSkel<'static>,
@@ -22,34 +20,6 @@ pub struct Bpf {
     /// Link for the `mon_iter_task` iterator. Attached once; every
     /// `bpf_iter_create()` on it (see `tasks::list_tasks`) runs a fresh pass.
     pub task_iter: Link,
-}
-
-/// Must match struct mon_track_req in bpf/mon.bpf.h.
-#[repr(C)]
-pub struct MonTrackReq {
-    pub pid: u32,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum TrackError {
-    #[error("no such process, or process is already exiting")]
-    NoSuchProcess,
-    #[error("TID given instead of PID (thread group leader)")]
-    NotAProcess,
-    #[error("tracked processes map is full")]
-    Full,
-    #[error("failed to run BPF program: {0}")]
-    Run(libbpf_rs::Error),
-    #[error("OS error: {0}")]
-    Os(i32),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum UntrackError {
-    #[error("failed to run BPF program: {0}")]
-    Run(libbpf_rs::Error),
-    #[error("OS error: {0}")]
-    Os(i32),
 }
 
 // Must match enum mon_log_level in bpf/logger.h.
@@ -113,8 +83,8 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
 
     let mut files = open_files.load().context("failed to load mon_files skeleton")?;
 
-    // mon_procs declares the same map; point it at the one mon_files created
-    // instead of letting libbpf make a second, empty copy.
+    // mon_procs declares the same task storage map; point it at the one
+    // mon_files created instead of letting libbpf make a second, empty copy.
     let mut open_procs = MonProcsSkelBuilder::default()
         .open(leak_storage())
         .context("failed to open mon_procs skeleton")?;
@@ -125,9 +95,9 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
 
     open_procs
         .maps
-        .tracked_pids
-        .reuse_fd(files.maps.tracked_pids.as_fd())
-        .context("failed to share tracked_pids with mon_procs")?;
+        .task_ctx_map
+        .reuse_fd(files.maps.task_ctx_map.as_fd())
+        .context("failed to share task_ctx_map with mon_procs")?;
 
     let mut procs = open_procs.load().context("failed to load mon_procs skeleton")?;
 
@@ -151,71 +121,6 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
     })
 }
 
-impl Bpf {
-    /// Register a host tgid synchronously via the kernel BPF program `mon_track_pid`.
-    ///
-    /// The BPF program verifies `task->pid == task->tgid`, inserts the entry, and only then
-    /// checks `task->signal->live`, undoing the insert if the thread group is already dead.
-    /// Checking after the insert (rather than before) closes the race where a process exits
-    /// between the check and the insert and leaves a dead PID stuck in `tracked_pids`.
-    pub fn register_pid(&self, pid: u32) -> std::result::Result<(), TrackError> {
-        let mut req = MonTrackReq { pid };
-        let ctx = unsafe {
-            std::slice::from_raw_parts_mut(
-                (&mut req as *mut MonTrackReq).cast::<u8>(),
-                std::mem::size_of::<MonTrackReq>(),
-            )
-        };
-
-        let out = self
-            .procs
-            .progs
-            .mon_track_pid
-            .test_run(ProgramInput {
-                context_in: Some(ctx),
-                ..Default::default()
-            })
-            .map_err(TrackError::Run)?;
-
-        match out.return_value as i32 {
-            0 => Ok(()),
-            -3 => Err(TrackError::NoSuchProcess), // ESRCH
-            -22 => Err(TrackError::NotAProcess), // EINVAL, tid given
-            -7 => Err(TrackError::Full),         // E2BIG
-            e => Err(TrackError::Os(-e)),
-        }
-    }
-
-    /// Untrack a host tgid synchronously via the kernel BPF program `mon_untrack_pid`.
-    ///
-    /// Returns `Ok(true)` if the PID was in `tracked_pids` and deleted,
-    /// or `Ok(false)` if the PID was not present (-ENOENT).
-    pub fn untrack_pid(&self, pid: u32) -> std::result::Result<bool, UntrackError> {
-        let mut req = MonTrackReq { pid };
-        let ctx = unsafe {
-            std::slice::from_raw_parts_mut(
-                (&mut req as *mut MonTrackReq).cast::<u8>(),
-                std::mem::size_of::<MonTrackReq>(),
-            )
-        };
-
-        let out = self
-            .procs
-            .progs
-            .mon_untrack_pid
-            .test_run(ProgramInput {
-                context_in: Some(ctx),
-                ..Default::default()
-            })
-            .map_err(UntrackError::Run)?;
-
-        match out.return_value as i32 {
-            0 => Ok(true),
-            -2 => Ok(false), // -ENOENT
-            e => Err(UntrackError::Os(-e)),
-        }
-    }
-}
 
 pub fn detach(bpf: Bpf) -> Result<()> {
     for (name, link) in bpf.links {

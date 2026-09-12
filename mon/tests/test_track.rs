@@ -5,24 +5,10 @@ use mon::server::{Command, Response, Server};
 
 #[test]
 fn parse_commands() {
-    let track: Command = serde_json::from_str(r#"{"cmd":"track","pid":1234}"#).unwrap();
-    assert_eq!(track, Command::Track { pid: 1234 });
+    let tree: Command = serde_json::from_str(r#"{"cmd":"tree","pid":1234}"#).unwrap();
+    assert_eq!(tree, Command::Tree { pid: 1234 });
 
-    let untrack: Command = serde_json::from_str(r#"{"cmd":"untrack","pid":5678}"#).unwrap();
-    assert_eq!(untrack, Command::Untrack { pid: 5678 });
-
-    let untrack_all: Command = serde_json::from_str(r#"{"cmd":"untrack_all"}"#).unwrap();
-    assert_eq!(untrack_all, Command::UntrackAll);
-
-    let untrack_all_hyphen: Command =
-        serde_json::from_str(r#"{"cmd":"untrack-all"}"#).unwrap();
-    assert_eq!(untrack_all_hyphen, Command::UntrackAll);
-
-    let list_tasks: Command = serde_json::from_str(r#"{"cmd":"list_tasks"}"#).unwrap();
-    assert_eq!(list_tasks, Command::ListTasks);
-
-    let ps: Command = serde_json::from_str(r#"{"cmd":"ps"}"#).unwrap();
-    assert_eq!(ps, Command::ListTasks);
+    assert!(serde_json::from_str::<Command>(r#"{"cmd":"track","pid":1}"#).is_err());
 }
 
 #[test]

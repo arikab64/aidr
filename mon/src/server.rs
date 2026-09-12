@@ -8,20 +8,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::bpf::Bpf;
-use crate::{tasks, track};
+use crate::tasks;
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/aidr/mon.sock";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    Track { pid: u32 },
-    Untrack { pid: u32 },
-    #[serde(alias = "untrack-all", alias = "untrackall")]
-    UntrackAll,
-    #[serde(alias = "list-tasks", alias = "ps")]
-    ListTasks,
-    /// Seed task_ctx_map with every task under `pid` and return the list.
     Tree { pid: u32 },
 }
 
@@ -51,10 +44,6 @@ impl Response {
 
 pub fn handle_command(bpf: &mut Bpf, cmd: Command) -> Response {
     match cmd {
-        Command::Track { pid } => track::handle_track(bpf, pid),
-        Command::Untrack { pid } => track::handle_untrack(bpf, pid),
-        Command::UntrackAll => track::handle_untrack_all(bpf),
-        Command::ListTasks => tasks::handle_list_tasks(bpf),
         Command::Tree { pid } => tasks::handle_tree(bpf, pid),
     }
 }
