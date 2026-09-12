@@ -41,7 +41,7 @@ def send_command(sock_path: Path, payload: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Manage tracked PIDs via the aidr monitor daemon socket."
+        description="Track or untrack process trees via the aidr monitor daemon socket."
     )
     parser.add_argument(
         "-s",
@@ -53,56 +53,32 @@ def main() -> int:
 
     action_group = parser.add_mutually_exclusive_group(required=True)
     action_group.add_argument(
-        "-a",
-        "--add",
+        "-t",
+        "--tree",
         type=int,
         nargs="+",
         metavar="PID",
-        help="Register PID(s) to track",
+        help="Track every task under PID(s) in the kernel and print the tree",
     )
     action_group.add_argument(
-        "-d",
-        "--delete",
+        "-u",
+        "--untrack",
         type=int,
         nargs="+",
         metavar="PID",
-        help="Delete PID(s) from tracking",
-    )
-    action_group.add_argument(
-        "--clean",
-        action="store_true",
-        help="Untrack all processes",
-    )
-    action_group.add_argument(
-        "-l",
-        "--list-tasks",
-        action="store_true",
-        help="List all tasks via the daemon's BPF task iterator",
-    )
-
-    action_group.add_argument(
-        "-t", "--tree",
-        type=int,
-        metavar="PID",
-        help="Mark every task under PID in the kernel and print the tree",
+        help="Untrack every task rooted at PID(s) and print what was removed",
     )
 
     args = parser.parse_args()
     sock_path = Path(args.socket)
 
     commands = []
-    if args.add:
-        for pid in args.add:
-            commands.append({"cmd": "track", "pid": pid})
-    elif args.delete:
-        for pid in args.delete:
+    if args.tree:
+        for pid in args.tree:
+            commands.append({"cmd": "tree", "pid": pid})
+    elif args.untrack:
+        for pid in args.untrack:
             commands.append({"cmd": "untrack", "pid": pid})
-    elif args.clean:
-        commands.append({"cmd": "untrack_all"})
-    elif args.list_tasks:
-        commands.append({"cmd": "list_tasks"})
-    elif args.tree:
-        commands.append({"cmd": "tree", "pid": args.tree})
 
     has_error = False
     for cmd in commands:
@@ -110,11 +86,8 @@ def main() -> int:
             resp = send_command(sock_path, cmd)
             status = resp.get("status")
             if status == "ok":
-                msg = resp.get("message", "ok")
-                if cmd["cmd"] == "list_tasks" or cmd["cmd"] == "tree":
-                    print(msg, end="")
-                else:
-                    print(f"[OK] {msg}")
+                # Both commands return the iterator's table; print it as is.
+                print(resp.get("message", ""), end="")
             else:
                 err = resp.get("error", "unknown error")
                 print(f"[ERROR] {err}", file=sys.stderr)

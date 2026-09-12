@@ -8,6 +8,9 @@ fn parse_commands() {
     let tree: Command = serde_json::from_str(r#"{"cmd":"tree","pid":1234}"#).unwrap();
     assert_eq!(tree, Command::Tree { pid: 1234 });
 
+    let untrack: Command = serde_json::from_str(r#"{"cmd":"untrack","pid":5678}"#).unwrap();
+    assert_eq!(untrack, Command::Untrack { pid: 5678 });
+
     assert!(serde_json::from_str::<Command>(r#"{"cmd":"track","pid":1}"#).is_err());
 }
 
