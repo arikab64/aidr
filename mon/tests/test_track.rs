@@ -17,6 +17,12 @@ fn parse_commands() {
     let untrack_all_hyphen: Command =
         serde_json::from_str(r#"{"cmd":"untrack-all"}"#).unwrap();
     assert_eq!(untrack_all_hyphen, Command::UntrackAll);
+
+    let list_tasks: Command = serde_json::from_str(r#"{"cmd":"list_tasks"}"#).unwrap();
+    assert_eq!(list_tasks, Command::ListTasks);
+
+    let ps: Command = serde_json::from_str(r#"{"cmd":"ps"}"#).unwrap();
+    assert_eq!(ps, Command::ListTasks);
 }
 
 #[test]

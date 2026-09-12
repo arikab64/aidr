@@ -3,7 +3,9 @@ use std::os::fd::AsFd;
 
 use anyhow::{Context, Result};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{Link, Object, OpenObject, ProgramInput, ProgramType};
+use libbpf_rs::{
+    IterOpts, Link, Object, OpenObject, ProgramAttachType, ProgramInput, ProgramType,
+};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -17,6 +19,9 @@ pub struct Bpf {
     pub files: MonFilesSkel<'static>,
     pub procs: MonProcsSkel<'static>,
     links: Vec<(String, Link)>,
+    /// Link for the `mon_iter_task` iterator. Attached once; every
+    /// `bpf_iter_create()` on it (see `tasks::list_tasks`) runs a fresh pass.
+    pub task_iter: Link,
 }
 
 /// Must match struct mon_track_req in bpf/mon.bpf.h.
@@ -68,10 +73,15 @@ fn leak_storage() -> &'static mut MaybeUninit<OpenObject> {
     Box::leak(Box::new(MaybeUninit::uninit()))
 }
 
-/// Attach every program in `obj`, returning the links that keep them attached.
+/// Attach every hook program in `obj`, returning the links that keep them
+/// attached. Skips `SEC("syscall")` programs (driven via test_run) and
+/// iterators (attached explicitly in `load`, since their link must be kept
+/// by name so userspace can create iterator fds from it).
 fn attach_all(obj: &mut Object, links: &mut Vec<(String, Link)>) -> Result<()> {
     for prog in obj.progs_mut() {
-        if prog.prog_type() == ProgramType::Syscall {
+        if prog.prog_type() == ProgramType::Syscall
+            || matches!(prog.attach_type(), ProgramAttachType::TraceIter)
+        {
             continue;
         }
         let name = prog.name().to_string_lossy().into_owned();
@@ -125,7 +135,20 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
     attach_all(files.object_mut(), &mut links)?;
     attach_all(procs.object_mut(), &mut links)?;
 
-    Ok(Bpf { files, procs, links })
+    // A task iterator has no target (no map, no cgroup), so plain options.
+    let task_iter = procs
+        .progs
+        .mon_iter_task
+        .attach_iter_with_opts(IterOpts::None)
+        .context("failed to attach mon_iter_task iterator")?;
+    info!("attached iterator mon_iter_task (iter/task)");
+
+    Ok(Bpf {
+        files,
+        procs,
+        links,
+        task_iter,
+    })
 }
 
 impl Bpf {
@@ -201,6 +224,9 @@ pub fn detach(bpf: Bpf) -> Result<()> {
         drop(link);
         info!("detached hook {name}");
     }
+
+    drop(bpf.task_iter);
+    info!("detached iterator mon_iter_task");
 
     Ok(())
 }

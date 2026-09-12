@@ -8,6 +8,19 @@ struct mon_track_req {
     u32 pid;
 };
 
+typedef struct root_id {
+    u32 id;
+    u64 starttime;
+} root_id_t;
+
+typedef struct task_ctx {
+    root_id_t root;
+    u32 tgid;
+    u32 tid;
+    u32 depth;
+} task_ctx_t;
+
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);

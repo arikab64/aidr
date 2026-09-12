@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::bpf::Bpf;
-use crate::track;
+use crate::{tasks, track};
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/aidr/mon.sock";
 
@@ -19,6 +19,10 @@ pub enum Command {
     Untrack { pid: u32 },
     #[serde(alias = "untrack-all", alias = "untrackall")]
     UntrackAll,
+    #[serde(alias = "list-tasks", alias = "ps")]
+    ListTasks,
+    /// Seed task_ctx_map with every task under `pid` and return the list.
+    Tree { pid: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,11 +49,13 @@ impl Response {
     }
 }
 
-pub fn handle_command(bpf: &Bpf, cmd: Command) -> Response {
+pub fn handle_command(bpf: &mut Bpf, cmd: Command) -> Response {
     match cmd {
         Command::Track { pid } => track::handle_track(bpf, pid),
         Command::Untrack { pid } => track::handle_untrack(bpf, pid),
         Command::UntrackAll => track::handle_untrack_all(bpf),
+        Command::ListTasks => tasks::handle_list_tasks(bpf),
+        Command::Tree { pid } => tasks::handle_tree(bpf, pid),
     }
 }
 
@@ -103,7 +109,7 @@ impl Server {
         self.listener.accept()
     }
 
-    pub fn poll_and_handle(&self, bpf: &Bpf) -> Result<()> {
+    pub fn poll_and_handle(&self, bpf: &mut Bpf) -> Result<()> {
         loop {
             match self.accept() {
                 Ok((stream, _)) => {
@@ -129,7 +135,7 @@ impl Drop for Server {
     }
 }
 
-fn handle_stream(bpf: &Bpf, mut stream: UnixStream) -> Result<()> {
+fn handle_stream(bpf: &mut Bpf, mut stream: UnixStream) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
         .context("failed to set read timeout")?;

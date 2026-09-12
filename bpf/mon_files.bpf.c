@@ -30,8 +30,6 @@ int BPF_PROG(mon_files_open, struct file *file)
 {
     char path[AIDR_PATH_MAX];
 
-    // Upper 32 bits are the tgid, i.e. the PID as userspace knows it; the
-    // lower half is the kernel task id (what userspace calls the thread id).
     u32 pid = bpf_get_current_pid_tgid() >> 32;
 
     if (!bpf_map_lookup_elem(&tracked_pids, &pid))
@@ -42,9 +40,9 @@ int BPF_PROG(mon_files_open, struct file *file)
     long len = bpf_d_path(&file->f_path, path, sizeof(path));
 
     if (len < 0)
-        log_info("file_open: pid=%u <d_path failed: %ld>", pid, len);
+        log_debug("file_open: pid=%u <d_path failed: %ld>", pid, len);
     else
-        log_info("file_open: pid=%u %s", pid, path);
+        log_debug("file_open: pid=%u %s", pid, path);
 
     return AIDR_RET(0);
 }
