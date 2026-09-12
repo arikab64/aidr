@@ -73,6 +73,19 @@ def main() -> int:
         action="store_true",
         help="Untrack all processes",
     )
+    action_group.add_argument(
+        "-l",
+        "--list-tasks",
+        action="store_true",
+        help="List all tasks via the daemon's BPF task iterator",
+    )
+
+    action_group.add_argument(
+        "-t", "--tree",
+        type=int,
+        metavar="PID",
+        help="Mark every task under PID in the kernel and print the tree",
+    )
 
     args = parser.parse_args()
     sock_path = Path(args.socket)
@@ -86,6 +99,10 @@ def main() -> int:
             commands.append({"cmd": "untrack", "pid": pid})
     elif args.clean:
         commands.append({"cmd": "untrack_all"})
+    elif args.list_tasks:
+        commands.append({"cmd": "list_tasks"})
+    elif args.tree:
+        commands.append({"cmd": "tree", "pid": args.tree})
 
     has_error = False
     for cmd in commands:
@@ -94,7 +111,10 @@ def main() -> int:
             status = resp.get("status")
             if status == "ok":
                 msg = resp.get("message", "ok")
-                print(f"[OK] {msg}")
+                if cmd["cmd"] == "list_tasks" or cmd["cmd"] == "tree":
+                    print(msg, end="")
+                else:
+                    print(f"[OK] {msg}")
             else:
                 err = resp.get("error", "unknown error")
                 print(f"[ERROR] {err}", file=sys.stderr)

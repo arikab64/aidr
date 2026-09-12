@@ -37,12 +37,12 @@ fn run_daemon(
 
     info!("Starting...");
 
-    let bpf = bpf::load(log_level)?;
+    let mut bpf = bpf::load(log_level)?;
     let server = Server::bind(socket_path)?;
     info!(socket = %server.path().display(), "listening for commands");
 
     while !shutdown.requested() {
-        server.poll_and_handle(&bpf)?;
+        server.poll_and_handle(&mut bpf)?;
         thread::sleep(POLL_INTERVAL);
     }
 

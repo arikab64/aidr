@@ -8,4 +8,5 @@ pub mod bpf;
 pub mod logger;
 pub mod server;
 pub mod signals;
+pub mod tasks;
 pub mod track;
