@@ -6,9 +6,16 @@
 #include "logger.h"
 #include "mon.bpf.h"
 
-// Userspace write it right before bpf_iter_create() to mark the root of the iteration. 
-// The iteration is on a single threaded, so no two pass overlaps.
+// Userspace writes these right before bpf_iter_create() to select the root and
+// the operation of the pass. The daemon is single threaded, so no two passes
+// overlap.
 volatile u32 mon_iter_root_pid = 0;
+
+enum mon_iter_op {
+    MON_ITER_MARK   = 0, // seed task_ctx_map for every task below the root
+    MON_ITER_UNMARK = 1, // drop every task_ctx whose root.id == root
+};
+volatile u32 mon_iter_op = MON_ITER_MARK;
 
 #define MAX_DEPTH 16
 
@@ -136,6 +143,18 @@ int mon_iter_task(struct bpf_iter__task *ctx)
         return 0;
 
     u32 root_pid = mon_iter_root_pid;
+
+    if (mon_iter_op == MON_ITER_UNMARK) {
+        task_ctx_t *tc = bpf_task_storage_get(&task_ctx_map, t, NULL, 0);
+        if (!tc || tc->root.id != root_pid)
+            return 0;
+
+        BPF_SEQ_PRINTF(seq, "%5d %5d %5u %s\n",
+                t->tgid, BPF_CORE_READ(t, real_parent, tgid), tc->depth, t->comm);
+        bpf_task_storage_delete(&task_ctx_map, t);
+        return 0;
+    }
+
     root_id_t root;
 
     int depth = resolve_ancestor(t, root_pid, &root);
