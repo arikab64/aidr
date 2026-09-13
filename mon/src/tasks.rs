@@ -5,6 +5,7 @@ use libbpf_rs::Iter;
 use tracing::{info, warn};
 
 use crate::bpf::Bpf;
+use crate::net;
 use crate::server::Response;
 
 // Must match enum mon_iter_op in bpf/mon_procs.bpf.c.
@@ -68,6 +69,18 @@ pub fn handle_tree(bpf: &mut Bpf, pid: u32, starttime: u64, workload_id: u64) ->
         Ok(out) => {
             let count = task_count(&out);
             info!(pid, workload_id, count, "built process tree");
+
+            // The tasks now carry their context, so their existing TCP
+            // sockets can be stamped. A failure here leaves the tree intact,
+            // so report it but keep the tree response.
+            match net::seed_sockets(bpf, workload_id) {
+                Ok(sockets) => {
+                    let sockets = net::socket_count(&sockets);
+                    info!(pid, workload_id, sockets, "seeded socket identities");
+                }
+                Err(e) => warn!(pid, workload_id, error = %e, "failed to seed socket identities"),
+            }
+
             Response::ok(out)
         }
         Err(e) => {

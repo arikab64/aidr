@@ -97,3 +97,4 @@ endfunction()
 
 add_bpf_program(mon_files)
 add_bpf_program(mon_procs)
+add_bpf_program(mon_net)
