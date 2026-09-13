@@ -10,7 +10,8 @@
 // the operation of the pass. The daemon is single threaded, so no two passes
 // overlap.
 volatile u32 mon_iter_root_pid = 0;
-
+volatile u64 mon_iter_root_starttime = 0;
+volatile u64 mon_iter_workload_id = 0;
 enum mon_iter_op {
     MON_ITER_MARK   = 0, // seed task_ctx_map for every task below the root
     MON_ITER_UNMARK = 1, // drop every task_ctx whose root.id == root
@@ -19,13 +20,20 @@ volatile u32 mon_iter_op = MON_ITER_MARK;
 
 #define MAX_DEPTH 16
 
-static __always_inline int depth_below(struct task_struct *t, u32 root_pid, struct task_struct **root)
+static __always_inline int depth_below(struct task_struct *t, u32 root_pid,
+        u64 root_starttime, 
+        struct task_struct **root)
 {
     struct task_struct *cur = t;
     for (int i = 0; i < MAX_DEPTH; i++) {
-        if (BPF_CORE_READ(cur, tgid) == root_pid) {
-            *root = cur;
-            return i;
+        if (BPF_CORE_READ(cur, tgid) == mon_iter_root_pid) {
+            u64 task_ticks = BPF_CORE_READ(cur, start_boottime) / 10000000ULL;
+            u64 min_ticks = root_starttime > 0 ? root_starttime - 1 : 0;
+            u64 max_ticks = root_starttime + 1;
+            if (task_ticks >= min_ticks && task_ticks <= max_ticks) {
+                *root = cur;
+                return i;
+            }
         }
         struct task_struct *parent = BPF_CORE_READ(cur, real_parent);
         if (parent == cur)
@@ -36,24 +44,20 @@ static __always_inline int depth_below(struct task_struct *t, u32 root_pid, stru
 }
 
 
-static __always_inline int resolve_ancestor(struct task_struct *t, u32 root_pid, root_id_t *root)
+static __always_inline int resolve_ancestor(struct task_struct *t, u32 root_pid)
 {
     // Fast path - parent is already marked for this root, so we are one deeper. 
     struct task_struct *parent = t->real_parent;
     task_ctx_t *pc = bpf_task_storage_get(&task_ctx_map, parent, NULL, 0);
-    if (pc && pc->root.id == root_pid && parent != t) {
-        *root = pc->root;
+    if (pc && pc->workload_id == mon_iter_workload_id && parent != t) {
         return pc->depth + 1;
     }
 
     // Slow path - walk up the parent chain to find a root.
     struct task_struct *root_task = NULL;
-    int depth = depth_below(t, root_pid, &root_task);
+    int depth = depth_below(t, root_pid, mon_iter_root_starttime, &root_task);
     if (depth < 0)
         return -1; // not below the root
-
-    root->id = root_pid;
-    root->starttime = BPF_CORE_READ(root_task, start_time);
 
     return depth;
 }
@@ -65,8 +69,8 @@ int BPF_PROG(mon_proc_fork, struct task_struct *parent, struct task_struct *chil
     u32 child_pid = child->tgid;
     bool is_thread = child_pid == parent_pid;
 
-    if (is_thread) 
-        return 0;
+    //if (is_thread) 
+    //    return 0;
 
     // Inherit the task context from the parent.
     task_ctx_t *pc = bpf_task_storage_get(&task_ctx_map, parent, NULL, 0);
@@ -74,12 +78,12 @@ int BPF_PROG(mon_proc_fork, struct task_struct *parent, struct task_struct *chil
         task_ctx_t *cc = bpf_task_storage_get(&task_ctx_map, child, NULL,
                                               BPF_LOCAL_STORAGE_GET_F_CREATE);
         if (cc) {
-            cc->root = pc->root;
+            cc->workload_id = pc->workload_id;
             cc->tgid = child_pid;
             cc->tid = child->pid;
             cc->depth = is_thread ? pc->depth : pc->depth + 1;
-            log_info("proc_fork: tid=%u pid=%u root=%u depth=%u inherited task ctx from tid=%u",
-                      cc->tid, cc->tgid, cc->root.id, cc->depth, parent->pid);
+            log_info("proc_fork [%llu]: tid=%u pid=%u workload=%llu depth=%u inherited task ctx from tid=%u",
+                      cc->workload_id, cc->tid, cc->tgid, cc->workload_id, cc->depth, parent->pid);
         } else {
             log_warn("proc_fork: tid=%u pid=%u no task ctx: storage alloc failed",
                      child->pid, child_pid);
@@ -103,8 +107,8 @@ int BPF_PROG(mon_proc_exec, struct task_struct *task, pid_t old_pid,
     tc->tgid = task->tgid;
     tc->tid = task->pid;
 
-    log_info("proc_exec: pid=%u old_tid=%d root=%u depth=%u %s",
-             tc->tgid, old_pid, tc->root.id, tc->depth, task->comm);
+    log_info("proc_exec [%llu]: pid=%u old_tid=%d depth=%u %s",
+              tc->workload_id, tc->tgid, old_pid,tc->depth, task->comm);
     return 0;
 }
 
@@ -131,6 +135,7 @@ int mon_iter_task(struct bpf_iter__task *ctx)
 {
     struct seq_file *seq = ctx->meta->seq;
     struct task_struct *t = ctx->task;
+    log_info("workload id=%llu, pid=%llu", mon_iter_workload_id, mon_iter_root_pid);
 
     if (!t)
         return 0;
@@ -139,14 +144,12 @@ int mon_iter_task(struct bpf_iter__task *ctx)
         BPF_SEQ_PRINTF(seq, "%5s %5s %5s %s\n", "PID", "PPID", "DEPTH", "COMM");
 
     // Processes only: skip every task that is not its thread group leader.
-    if (t->pid != t->tgid)
-        return 0;
-
-    u32 root_pid = mon_iter_root_pid;
+    //if (t->pid != t->tgid)
+    //    return 0;
 
     if (mon_iter_op == MON_ITER_UNMARK) {
         task_ctx_t *tc = bpf_task_storage_get(&task_ctx_map, t, NULL, 0);
-        if (!tc || tc->root.id != root_pid)
+        if (!tc || tc->workload_id != mon_iter_workload_id)
             return 0;
 
         BPF_SEQ_PRINTF(seq, "%5d %5d %5u %s\n",
@@ -155,9 +158,10 @@ int mon_iter_task(struct bpf_iter__task *ctx)
         return 0;
     }
 
-    root_id_t root;
+    u64 workload_id = mon_iter_workload_id;
+    u32 root_pid = mon_iter_root_pid;
 
-    int depth = resolve_ancestor(t, root_pid, &root);
+    int depth = resolve_ancestor(t, root_pid);
     if (depth < 0)
         return 0;
     
@@ -165,7 +169,7 @@ int mon_iter_task(struct bpf_iter__task *ctx)
     if (!tc)
         return 0;
 
-    tc->root = root;
+    tc->workload_id = workload_id;
     tc->tgid = t->tgid;
     tc->tid = t->pid;
     tc->depth = depth;

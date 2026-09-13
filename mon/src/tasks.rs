@@ -17,7 +17,7 @@ const MON_ITER_UNMARK: u32 = 1;
 ///
 /// The iterator program is attached once at load; every call here creates a
 /// fresh iterator fd from that link, so each pass sees the current task list.
-fn run_iter(bpf: &mut Bpf, root_pid: u32, op: u32) -> Result<String> {
+fn run_iter(bpf: &mut Bpf, root_pid: u32, root_starttime: u64, workload_id: u64, op: u32) -> Result<String> {
     let bss = bpf
         .procs
         .maps
@@ -25,6 +25,8 @@ fn run_iter(bpf: &mut Bpf, root_pid: u32, op: u32) -> Result<String> {
         .as_mut()
         .context("failed to get BSS data")?;
     bss.mon_iter_root_pid = root_pid;
+    bss.mon_iter_root_starttime = root_starttime;
+    bss.mon_iter_workload_id = workload_id;
     bss.mon_iter_op = op;
 
     let mut iter = Iter::new(&bpf.task_iter).context("failed to create task iterator")?;
@@ -40,8 +42,8 @@ fn task_count(out: &str) -> usize {
 }
 
 /// Seed `task_ctx_map` with every task below `root_pid`.
-pub fn build_tree(bpf: &mut Bpf, root_pid: u32) -> Result<String> {
-    run_iter(bpf, root_pid, MON_ITER_MARK)
+pub fn build_tree(bpf: &mut Bpf, root_pid: u32, root_starttime: u64, workload_id: u64) -> Result<String> {
+    run_iter(bpf, root_pid, root_starttime, workload_id, MON_ITER_MARK)
 }
 
 /// Drop every task context whose root is `root_pid`.
@@ -49,23 +51,23 @@ pub fn build_tree(bpf: &mut Bpf, root_pid: u32) -> Result<String> {
 /// A tracked parent that forks while the pass is running can hand its context
 /// to a child in a PID slot the iterator already passed, so if the first pass
 /// removed anything, run a second one to catch stragglers.
-pub fn untrack_tree(bpf: &mut Bpf, root_pid: u32) -> Result<String> {
-    let out = run_iter(bpf, root_pid, MON_ITER_UNMARK)?;
+pub fn untrack_tree(bpf: &mut Bpf, workload_id: u64) -> Result<String> {
+    let out = run_iter(bpf, 0, 0, workload_id, MON_ITER_UNMARK)?;
     if task_count(&out) > 0 {
-        let second = run_iter(bpf, root_pid, MON_ITER_UNMARK)?;
+        let second = run_iter(bpf, 0, 0, workload_id, MON_ITER_UNMARK)?;
         let stragglers = task_count(&second);
         if stragglers > 0 {
-            info!(pid = root_pid, stragglers, "second untrack pass removed stragglers");
+            info!(workload_id, stragglers, "second untrack pass removed stragglers");
         }
     }
     Ok(out)
 }
 
-pub fn handle_tree(bpf: &mut Bpf, pid: u32) -> Response {
-    match build_tree(bpf, pid) {
+pub fn handle_tree(bpf: &mut Bpf, pid: u32, starttime: u64, workload_id: u64) -> Response {
+    match build_tree(bpf, pid, starttime, workload_id) {
         Ok(out) => {
             let count = task_count(&out);
-            info!(pid, count, "built process tree");
+            info!(pid, workload_id, count, "built process tree");
             Response::ok(out)
         }
         Err(e) => {
@@ -75,16 +77,16 @@ pub fn handle_tree(bpf: &mut Bpf, pid: u32) -> Response {
     }
 }
 
-pub fn handle_untrack(bpf: &mut Bpf, pid: u32) -> Response {
-    match untrack_tree(bpf, pid) {
+pub fn handle_untrack(bpf: &mut Bpf, workload_id: u64) -> Response {
+    match untrack_tree(bpf, workload_id) {
         Ok(out) => {
             let count = task_count(&out);
-            info!(pid, count, "untracked process tree");
+            info!(workload_id, count, "untracked process tree");
             Response::ok(out)
         }
         Err(e) => {
-            warn!(pid, error = %e, "failed to untrack process tree");
-            Response::error(format!("failed to untrack tree for pid {pid}: {e}"))
+            warn!(workload_id, error = %e, "failed to untrack process tree");
+            Response::error(format!("failed to untrack tree for workload_id {workload_id}: {e}"))
         }
     }
 }

@@ -39,6 +39,25 @@ def send_command(sock_path: Path, payload: dict) -> dict:
         client.close()
 
 
+def get_starttime(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat_str = f.read()
+            # The process name is enclosed in parentheses and may contain spaces.
+            # Find the last ')' to safely split the rest of the fields.
+            rparen_idx = stat_str.rfind(')')
+            if rparen_idx != -1:
+                # The substring after ') ' contains fields starting from index 2 (state)
+                rest = stat_str[rparen_idx + 2:]
+                parts = rest.split()
+                # starttime is the 22nd field overall (index 21).
+                # Since we skipped the first 2 fields (pid, comm), it is at index 19 of `rest`.
+                return int(parts[19])
+    except Exception:
+        pass
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Track or untrack process trees via the aidr monitor daemon socket."
@@ -56,17 +75,17 @@ def main() -> int:
         "-t",
         "--tree",
         type=int,
-        nargs="+",
-        metavar="PID",
-        help="Track every task under PID(s) in the kernel and print the tree",
+        nargs=2,
+        metavar=("PID", "WORKLOAD_ID"),
+        help="Track every task under PID and assign it WORKLOAD_ID",
     )
     action_group.add_argument(
         "-u",
         "--untrack",
         type=int,
         nargs="+",
-        metavar="PID",
-        help="Untrack every task rooted at PID(s) and print what was removed",
+        metavar="WORKLOAD_ID",
+        help="Untrack every task associated with WORKLOAD_ID(s)",
     )
 
     args = parser.parse_args()
@@ -74,11 +93,17 @@ def main() -> int:
 
     commands = []
     if args.tree:
-        for pid in args.tree:
-            commands.append({"cmd": "tree", "pid": pid})
+        pid, workload_id = args.tree
+        starttime = get_starttime(pid)
+        commands.append({
+            "cmd": "tree",
+            "pid": pid,
+            "starttime": starttime,
+            "workload_id": workload_id
+        })
     elif args.untrack:
-        for pid in args.untrack:
-            commands.append({"cmd": "untrack", "pid": pid})
+        for w_id in args.untrack:
+            commands.append({"cmd": "untrack", "workload_id": w_id})
 
     has_error = False
     for cmd in commands:
