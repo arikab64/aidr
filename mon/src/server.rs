@@ -16,9 +16,9 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/aidr/mon.sock";
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     /// Seed task_ctx_map with every task under `pid` and return the list.
-    Tree { pid: u32 },
-    /// Drop every task context rooted at `pid` and return the list.
-    Untrack { pid: u32 },
+    Tree { pid: u32, starttime: u64, workload_id: u64 },
+    /// Drop every task context tracked under `workload_id` and return the list.
+    Untrack { workload_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,8 +47,8 @@ impl Response {
 
 pub fn handle_command(bpf: &mut Bpf, cmd: Command) -> Response {
     match cmd {
-        Command::Tree { pid } => tasks::handle_tree(bpf, pid),
-        Command::Untrack { pid } => tasks::handle_untrack(bpf, pid),
+        Command::Tree { pid, starttime, workload_id } => tasks::handle_tree(bpf, pid, starttime, workload_id),
+        Command::Untrack { workload_id } => tasks::handle_untrack(bpf, workload_id),
     }
 }
 

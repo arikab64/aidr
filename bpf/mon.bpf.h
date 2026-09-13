@@ -4,13 +4,8 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
-typedef struct root_id {
-    u32 id;
-    u64 starttime;
-} root_id_t;
-
 typedef struct task_ctx {
-    root_id_t root;
+    u64 workload_id;
     u32 tgid;
     u32 tid;
     u32 depth;
