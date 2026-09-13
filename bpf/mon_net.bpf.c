@@ -8,10 +8,11 @@
 #include "mon.bpf.h"
 
 struct conn_ident {
-    __u64 workload_id;
-    __u64 leader_start_boottime;  /* disambiguates tgid under pid reuse */
-    __u32 tgid;
-    __u32 tid;                    /* the connecting thread */
+    u64 workload_id;
+    u64 leader_start_boottime;  /* disambiguates tgid under pid reuse */
+    u32 tgid;
+    u32 tid;                    /* the connecting thread */
+    sock_tuple_t tuple;         /* the 5-tuple of the socket, in host byte order */
 };
 
 struct {
@@ -20,11 +21,6 @@ struct {
     __type(key, int);
     __type(value, struct conn_ident);
 } conn_ident_map SEC(".maps");
-
-#ifndef AF_INET
-#define AF_INET  2
-#define AF_INET6 10
-#endif
 
 // Userspace writes these right before bpf_iter_create() to select the
 // workload and the operation of the pass. Single threaded daemon, so passes
@@ -37,17 +33,48 @@ enum mon_net_iter_op {
 };
 volatile u32 mon_net_iter_op = MON_NET_ITER_DUMP;
 
+
+// Fill *t from a sock_common, the prefix every socket kind shares (full,
+// request, and timewait socks alike), so this also serves iter/tcp. proto
+// is passed in because it lives outside sock_common.
+static __always_inline void sock_tuple_from_skc(struct sock_common *skc,
+                                                u8 proto, sock_tuple_t *t)
+{
+    u16 sport = skc->skc_num;
+
+    t->ipv4 = skc->skc_family != AF_INET6;
+    t->proto = proto;
+    t->sport = sport ? sport : -1;
+    t->dport = bpf_ntohs(skc->skc_dport);
+
+    if (t->ipv4) {
+        t->saddr.v4 = skc->skc_rcv_saddr;
+        t->daddr.v4 = skc->skc_daddr;
+    } else {
+        t->saddr.v6 = skc->skc_v6_rcv_saddr;
+        t->daddr.v6 = skc->skc_v6_daddr;
+    }
+}
+
+// Fill *t from a full socket.
+static __always_inline void sock_tuple_from_sk(struct sock *sk, sock_tuple_t *t)
+{
+    sock_tuple_from_skc(&sk->__sk_common, sk->sk_protocol, t);
+}
+
+
 // Fill *ci from a task known to be tracked. group_leader->start_boottime is
 // stable for the life of the thread group, so (tgid, leader_start_boottime)
 // still names the right process after the tgid has been reused.
 static __always_inline void fill_conn_ident(struct conn_ident *ci,
                                             struct task_struct *task,
-                                            task_ctx_t *tc, u32 tid)
+                                            task_ctx_t *tc, u32 tid, sock_tuple_t *tuple)
 {
     ci->workload_id = tc->workload_id;
     ci->leader_start_boottime = BPF_CORE_READ(task, group_leader, start_boottime);
     ci->tgid = task->tgid;
     ci->tid = tid;
+    ci->tuple = *tuple;
 }
 
 // tcp_connect() sends the SYN, synchronously on the connect(2) path, so
@@ -69,10 +96,22 @@ int BPF_PROG(mon_net_connect, struct sock *sk)
         return 0;
     }
 
-    fill_conn_ident(ci, task, tc, (u32)bpf_get_current_pid_tgid());
+    sock_tuple_t tuple;
+    sock_tuple_from_sk(sk, &tuple);
+    fill_conn_ident(ci, task, tc, (u32)bpf_get_current_pid_tgid(), &tuple);
+    sock_tuple_t *t = &ci->tuple;
 
     log_info("net_connect [%llu]: pid=%u tid=%u leader_start=%llu conn ident stored",
              ci->workload_id, ci->tgid, ci->tid, ci->leader_start_boottime);
+
+    if (t->ipv4)
+        log_info("net_connect [%llu]: pid=%u proto=%u %pI4:%d -> %pI4:%u",
+                 ci->workload_id, ci->tgid, t->proto,
+                 &t->saddr.v4, t->sport, &t->daddr.v4, t->dport);
+    else
+        log_info("net_connect [%llu]: pid=%u proto=%u [%pI6]:%d -> [%pI6]:%u",
+                 ci->workload_id, ci->tgid, t->proto,
+                 &t->saddr.v6, t->sport, &t->daddr.v6, t->dport);
 
     return 0;
 }
@@ -122,7 +161,9 @@ int mon_iter_task_file(struct bpf_iter__task_file *ctx)
     if (!ci)
         return 0;
 
-    fill_conn_ident(ci, task, tc, 0);
+    sock_tuple_t t;
+    sock_tuple_from_sk(sk, &t);
+    fill_conn_ident(ci, task, tc, 0, &t);
 
     log_info("SOCK: %5d %5d %5u\n", task->tgid, task->pid, ctx->fd);
     BPF_SEQ_PRINTF(seq, "%5d %5d %5u\n", task->tgid, task->pid, ctx->fd);
@@ -133,26 +174,22 @@ static __always_inline void seq_print_conn(struct seq_file *seq,
                                            struct sock_common *skc,
                                            struct conn_ident *ci)
 {
-    u16 family = skc->skc_family;
-    u16 sport = skc->skc_num;                 // host order
-    u16 dport = bpf_ntohs(skc->skc_dport);    // network order
     u8 state = skc->skc_state;
+    sock_tuple_t t;
 
-    if (family == AF_INET6) {
-        struct in6_addr saddr = skc->skc_v6_rcv_saddr;
-        struct in6_addr daddr = skc->skc_v6_daddr;
-        BPF_SEQ_PRINTF(seq, "%llu %llu %5u %5u %2u [%pI6]:%u [%pI6]:%u\n",
+    // iter/tcp only ever hands out TCP sockets.
+    sock_tuple_from_skc(skc, IPPROTO_TCP, &t);
+
+    if (t.ipv4)
+        BPF_SEQ_PRINTF(seq, "%llu %llu %5u %5u %2u %pI4:%d %pI4:%u\n",
                        ci->workload_id, ci->leader_start_boottime,
                        ci->tgid, ci->tid, state,
-                       &saddr, sport, &daddr, dport);
-    } else {
-        u32 saddr = skc->skc_rcv_saddr;
-        u32 daddr = skc->skc_daddr;
-        BPF_SEQ_PRINTF(seq, "%llu %llu %5u %5u %2u %pI4:%u %pI4:%u\n",
+                       &t.saddr.v4, t.sport, &t.daddr.v4, t.dport);
+    else
+        BPF_SEQ_PRINTF(seq, "%llu %llu %5u %5u %2u [%pI6]:%d [%pI6]:%u\n",
                        ci->workload_id, ci->leader_start_boottime,
                        ci->tgid, ci->tid, state,
-                       &saddr, sport, &daddr, dport);
-    }
+                       &t.saddr.v6, t.sport, &t.daddr.v6, t.dport);
 }
 
 // Walks every TCP socket (all states, both families). Sockets without a
