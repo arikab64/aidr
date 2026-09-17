@@ -116,6 +116,140 @@ int BPF_PROG(mon_net_connect, struct sock *sk)
     return 0;
 }
 
+// tcp_sendmsg() is called when sending data on a TCP socket.
+// We use this to detect the first send and log the need to parse.
+#ifndef ITER_UBUF
+#define ITER_UBUF 0
+#endif
+#ifndef ITER_IOVEC
+#define ITER_IOVEC 1
+#endif
+
+#define MAX_SNI_READ 255
+
+static __always_inline void parse_sni(struct msghdr *msg, struct conn_ident *ci) {
+    u8 iter_type = BPF_CORE_READ(msg, msg_iter.iter_type);
+    void *buf = NULL;
+    size_t len = 0;
+
+    if (iter_type == ITER_UBUF) {
+        buf = BPF_CORE_READ(msg, msg_iter.ubuf);
+        len = BPF_CORE_READ(msg, msg_iter.count);
+    } else if (iter_type == ITER_IOVEC) {
+        const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
+        buf = BPF_CORE_READ(iov, iov_base);
+        len = BPF_CORE_READ(iov, iov_len);
+    }
+
+    if (!buf || len < 47) return;
+
+    char data[MAX_SNI_READ];
+    size_t read_len = len;
+    if (read_len > MAX_SNI_READ) read_len = MAX_SNI_READ;
+    
+    if (bpf_probe_read_user(data, read_len & 0xFF, buf) < 0) {
+        return;
+    }
+
+    if (data[0] != 0x16) return; // Handshake
+    if (data[1] != 0x03) return; // Version
+    if (data[5] != 0x01) return; // Client Hello
+
+    int offset = 43;
+    if (offset >= read_len) return;
+    u8 session_id_len = data[(offset) & 0xFF];
+    offset += 1 + session_id_len;
+
+    if (offset + 2 > read_len) return;
+    u16 cipher_suites_len = (data[(offset) & 0xFF] << 8) | data[(offset + 1) & 0xFF];
+    offset += 2 + cipher_suites_len;
+
+    if (offset + 1 > read_len) return;
+    u8 comp_methods_len = data[(offset) & 0xFF];
+    offset += 1 + comp_methods_len;
+
+    if (offset + 2 > read_len) return;
+    u16 ext_len = (data[(offset) & 0xFF] << 8) | data[(offset + 1) & 0xFF];
+    offset += 2;
+
+    int limit = offset + ext_len;
+    if (limit > read_len) limit = read_len;
+
+    #pragma unroll
+    for (int i = 0; i < 10; i++) {
+        if (offset + 4 > limit) break;
+        u16 ext_type = (data[(offset) & 0xFF] << 8) | data[(offset + 1) & 0xFF];
+        u16 ext_length = (data[(offset + 2) & 0xFF] << 8) | data[(offset + 3) & 0xFF];
+        offset += 4;
+
+        if (ext_type == 0) { // SNI
+            if (offset + 2 > limit) break;
+            u16 sni_list_len = (data[(offset) & 0xFF] << 8) | data[(offset + 1) & 0xFF];
+            offset += 2;
+            
+            if (offset + 3 > limit) break;
+            u8 sni_type = data[(offset) & 0xFF];
+            u16 sni_len = (data[(offset + 1) & 0xFF] << 8) | data[(offset + 2) & 0xFF];
+            offset += 3;
+
+            if (sni_type == 0 && offset + sni_len <= limit) {
+                char sni[64] = {0};
+                int cp_len = sni_len;
+                if (cp_len > sizeof(sni) - 1) cp_len = sizeof(sni) - 1;
+                
+                for (int j = 0; j < sizeof(sni); j++) {
+                    if (j >= (cp_len & 0x3F)) break;
+                    sni[j] = data[(offset + j) & 0xFF];
+                }
+                
+                log_info("net_sendmsg [%llu]: pid=%u tid=%u SNI: %s",
+                         ci->workload_id, ci->tgid, ci->tid, sni);
+                return;
+            }
+        }
+        offset += ext_length;
+    }
+}
+SEC("fentry/tcp_sendmsg")
+int BPF_PROG(mon_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
+{
+    struct task_struct *task = bpf_get_current_task_btf();
+    struct tcp_sock *tp = (struct tcp_sock *)sk;
+    u64 bytes_sent = BPF_CORE_READ(tp, bytes_sent);
+    
+    struct conn_ident *ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, 0);
+    if (!ci) {
+        task_ctx_t *tc = bpf_task_storage_get(&task_ctx_map, task, NULL, 0);
+        if (!tc)
+            return 0;
+
+        ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (!ci) {
+            log_warn("net_sendmsg [%llu]: tid=%u no conn ident: storage alloc failed",
+                     tc->workload_id, tc->tid);
+            return 0;
+        }
+
+        sock_tuple_t tuple;
+        sock_tuple_from_sk(sk, &tuple);
+        fill_conn_ident(ci, task, tc, (u32)bpf_get_current_pid_tgid(), &tuple);
+        
+        log_info("net_sendmsg [%llu]: pid=%u tid=%u leader_start=%llu conn ident stored",
+                 ci->workload_id, ci->tgid, ci->tid, ci->leader_start_boottime);
+    }
+    
+    if (bytes_sent == 0) {
+        if (ci->tuple.dport == 443) {
+            parse_sni(msg, ci);
+        } else {
+            log_info("net_sendmsg [%llu]: pid=%u tid=%u need to parse",
+                     ci->workload_id, ci->tgid, ci->tid);
+        }
+    }
+
+    return 0;
+}
+
 // Seed pass, run right after mon_iter_task has marked a workload: walk the
 // open files of every task, and give each TCP socket owned by a task of
 // mon_net_iter_workload_id a conn_ident. This is the iterator that can reach
