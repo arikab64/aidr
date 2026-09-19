@@ -6,6 +6,15 @@
 
 #include "logger.h"
 #include "mon.bpf.h"
+#include "mon_progs.bpf.h"
+
+#define DNS_PORT    53
+#define MDNS_PORT   5353
+
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+#define ETH_P_IP    0x0800
+#define ETH_P_IPV6  0x86DD
 
 struct conn_ident {
     u64 workload_id;
@@ -250,6 +259,35 @@ int BPF_PROG(mon_net_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
     return 0;
 }
 
+SEC("fentry/udp_sendmsg")
+int BPF_PROG(mon_net_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    struct task_struct *task = bpf_get_current_task_btf();
+    
+    struct conn_ident *ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, 0);
+    if (!ci) {
+        task_ctx_t *tc = bpf_task_storage_get(&task_ctx_map, task, NULL, 0);
+        if (!tc)
+            return 0;
+
+        ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (!ci) {
+            log_warn("udp_sendmsg [%llu]: tid=%u no conn ident: storage alloc failed",
+                     tc->workload_id, tc->tid);
+            return 0;
+        }
+
+        sock_tuple_t tuple;
+        sock_tuple_from_sk(sk, &tuple);
+        fill_conn_ident(ci, task, tc, (u32)bpf_get_current_pid_tgid(), &tuple);
+        
+        log_info("udp_sendmsg [%llu]: pid=%u tid=%u leader_start=%llu conn ident stored",
+                 ci->workload_id, ci->tgid, ci->tid, ci->leader_start_boottime);
+    }
+
+    return 0;
+}
+
 // Seed pass, run right after mon_iter_task has marked a workload: walk the
 // open files of every task, and give each TCP socket owned by a task of
 // mon_net_iter_workload_id a conn_ident. This is the iterator that can reach
@@ -283,7 +321,7 @@ int mon_iter_task_file(struct bpf_iter__task_file *ctx)
         return 0;
 
     struct sock *sk = sock->sk;
-    if (!sk || sk->sk_protocol != IPPROTO_TCP)
+    if (!sk || (sk->sk_protocol != IPPROTO_TCP && sk->sk_protocol != IPPROTO_UDP))
         return 0;
 
     // Stamped already, by tcp_connect or an earlier pass.
@@ -362,6 +400,95 @@ int mon_iter_tcp(struct bpf_iter__tcp *ctx)
         return 0;
 
     seq_print_conn(seq, skc, ci);
+    return 0;
+}
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} jmp_table SEC(".maps");
+
+#define MAX_DNS_READ 255
+
+static __always_inline void parse_dns_qname(struct msghdr *msg, struct conn_ident *ci) {
+    u8 iter_type = BPF_CORE_READ(msg, msg_iter.iter_type);
+    void *buf = NULL;
+    size_t len = 0;
+
+    if (iter_type == ITER_UBUF) {
+        buf = BPF_CORE_READ(msg, msg_iter.ubuf);
+        len = BPF_CORE_READ(msg, msg_iter.count);
+    } else if (iter_type == ITER_IOVEC) {
+        const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
+        buf = BPF_CORE_READ(iov, iov_base);
+        len = BPF_CORE_READ(iov, iov_len);
+    }
+
+    if (!buf || len < 12) return;
+
+    char data[MAX_DNS_READ];
+    size_t read_len = len;
+    if (read_len > MAX_DNS_READ) read_len = MAX_DNS_READ;
+    
+    if (bpf_probe_read_user(data, read_len & 0xFF, buf) < 0) {
+        return;
+    }
+
+    // Check if response (QR bit is MSB of data[2])
+    if ((data[2] & 0x80) == 0) return;
+
+    u16 qdcount = (data[4] << 8) | data[5];
+    if (qdcount == 0) return;
+
+    int offset = 12; // Start of QNAME
+    char qname[64] = {0};
+    int qname_idx = 0;
+    u8 label_len = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        if (offset >= read_len) break;
+        
+        if (label_len == 0) {
+            label_len = data[offset & 0xFF];
+            if (label_len == 0) break; // End of QNAME
+            if ((label_len & 0xC0) == 0xC0) break; // Pointer compression
+
+            if (qname_idx > 0 && qname_idx < sizeof(qname) - 1) {
+                qname[qname_idx++] = '.';
+            }
+        } else {
+            if (qname_idx < sizeof(qname) - 1) {
+                qname[qname_idx++] = data[offset & 0xFF];
+            }
+            label_len--;
+        }
+        offset++;
+    }
+
+    log_info("dns [%llu]: pid=%u tid=%u qname=%s", ci->workload_id, ci->tgid, ci->tid, qname);
+}
+
+SEC("fexit/udp_recvmsg")
+int BPF_PROG(mon_parse_dns_qname, struct sock *sk, struct msghdr *msg)
+{
+    struct conn_ident *ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, 0);
+    if (!ci) return 0;
+    
+    parse_dns_qname(msg, ci);
+    return 0;
+}
+
+SEC("fexit/udp_recvmsg")
+int BPF_PROG(mon_udp_recvmsg, struct sock *sk, struct msghdr *msg)
+{
+    struct conn_ident *ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, 0);
+    if (!ci)
+        return 0;
+
+    bpf_tail_call(ctx, &jmp_table, PROG_PARSE_DNS_QNAME);
     return 0;
 }
 
