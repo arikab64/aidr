@@ -1,15 +1,21 @@
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
+use std::os::unix::io::AsRawFd;
 
 use anyhow::{Context, Result};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{IterOpts, Link, Object, OpenObject, ProgramAttachType, ProgramType};
+use libbpf_rs::{IterOpts, Link, MapCore, Object, OpenObject, ProgramAttachType, ProgramType};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::mon_files_skel::{MonFilesSkel, MonFilesSkelBuilder};
 use crate::mon_net_skel::{MonNetSkel, MonNetSkelBuilder};
 use crate::mon_procs_skel::{MonProcsSkel, MonProcsSkelBuilder};
+
+
+// PROGRAMS
+pub const PROG_PARSE_DNS_QNAME: u32 = 0;
+
 
 pub struct Bpf {
     /// Own the loaded BPF objects; held so the programs stay loaded for as
@@ -63,6 +69,9 @@ fn attach_all(obj: &mut Object, links: &mut Vec<(String, Link)>) -> Result<()> {
             continue;
         }
         let name = prog.name().to_string_lossy().into_owned();
+        if name == "mon_parse_dns_qname" {
+            continue; // Tail call target, attached manually
+        }
         let section = prog.section().to_string_lossy().into_owned();
         let link = prog
             .attach()
@@ -131,6 +140,8 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
     attach_all(procs.object_mut(), &mut links)?;
     attach_all(net.object_mut(), &mut links)?;
 
+
+
     // These iterators have no target (no map, no cgroup), so plain options.
     let task_iter = procs
         .progs
@@ -152,6 +163,14 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
         .attach_iter_with_opts(IterOpts::None)
         .context("failed to attach mon_iter_tcp iterator")?;
     info!("attached iterator mon_iter_tcp (iter/tcp)");
+
+    let fd = net.progs.mon_parse_dns_qname.as_fd().as_raw_fd() as u32;
+    let key: u32 = PROG_PARSE_DNS_QNAME;
+    net.maps
+        .jmp_table
+        .update(&key.to_ne_bytes(), &fd.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+        .context("failed to populate jmp_table with target_prog")?;
+    info!("registered tail call mon_parse_dns_qname at index {}", key);
 
     Ok(Bpf {
         files,
