@@ -15,7 +15,7 @@ use crate::mon_procs_skel::{MonProcsSkel, MonProcsSkelBuilder};
 
 // PROGRAMS
 pub const PROG_PARSE_DNS_QNAME: u32 = 0;
-
+pub const PROG_PARSE_DNS_ANSWERS: u32 = 1;
 
 pub struct Bpf {
     /// Own the loaded BPF objects; held so the programs stay loaded for as
@@ -69,7 +69,7 @@ fn attach_all(obj: &mut Object, links: &mut Vec<(String, Link)>) -> Result<()> {
             continue;
         }
         let name = prog.name().to_string_lossy().into_owned();
-        if name == "mon_parse_dns_qname" {
+        if name == "mon_parse_dns_qname" || name == "mon_parse_dns_answers" {
             continue; // Tail call target, attached manually
         }
         let section = prog.section().to_string_lossy().into_owned();
@@ -169,8 +169,16 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
     net.maps
         .jmp_table
         .update(&key.to_ne_bytes(), &fd.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
-        .context("failed to populate jmp_table with target_prog")?;
+        .context("failed to populate jmp_table with target_prog qname")?;
     info!("registered tail call mon_parse_dns_qname at index {}", key);
+
+    let fd_ans = net.progs.mon_parse_dns_answers.as_fd().as_raw_fd() as u32;
+    let key_ans: u32 = PROG_PARSE_DNS_ANSWERS;
+    net.maps
+        .jmp_table
+        .update(&key_ans.to_ne_bytes(), &fd_ans.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+        .context("failed to populate jmp_table with target_prog answers")?;
+    info!("registered tail call mon_parse_dns_answers at index {}", key_ans);
 
     Ok(Bpf {
         files,

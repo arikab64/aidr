@@ -405,14 +405,27 @@ int mon_iter_tcp(struct bpf_iter__tcp *ctx)
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
     __type(key, u32);
     __type(value, u32);
 } jmp_table SEC(".maps");
 
+struct dns_parse_state {
+    int offset;
+    u16 ancount;
+    char qname[64];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct dns_parse_state);
+} dns_state_map SEC(".maps");
+
 #define MAX_DNS_READ 255
 
-static __always_inline void parse_dns_qname(struct msghdr *msg, struct conn_ident *ci) {
+static __always_inline void parse_dns_qname(struct msghdr *msg, struct conn_ident *ci, void *ctx) {
     u8 iter_type = BPF_CORE_READ(msg, msg_iter.iter_type);
     void *buf = NULL;
     size_t len = 0;
@@ -436,39 +449,137 @@ static __always_inline void parse_dns_qname(struct msghdr *msg, struct conn_iden
         return;
     }
 
-    // Check if response (QR bit is MSB of data[2])
     if ((data[2] & 0x80) == 0) return;
 
     u16 qdcount = (data[4] << 8) | data[5];
-    if (qdcount == 0) return;
+    if (qdcount > 1 || qdcount == 0) return;
 
-    int offset = 12; // Start of QNAME
-    char qname[64] = {0};
+    u16 ancount = (data[6] << 8) | data[7];
+    if (ancount == 0) return;
+
+    u32 key = 0;
+    struct dns_parse_state *state = bpf_map_lookup_elem(&dns_state_map, &key);
+    if (!state) return;
+
+    state->ancount = ancount;
+    state->offset = 12; // Start of QNAME
+    state->qname[0] = '\0';
     int qname_idx = 0;
     u8 label_len = 0;
 
     #pragma unroll
     for (int i = 0; i < 64; i++) {
-        if (offset >= read_len) break;
+        if (state->offset >= read_len) break;
         
         if (label_len == 0) {
-            label_len = data[offset & 0xFF];
+            label_len = data[state->offset & 0xFF];
             if (label_len == 0) break; // End of QNAME
             if ((label_len & 0xC0) == 0xC0) break; // Pointer compression
 
-            if (qname_idx > 0 && qname_idx < sizeof(qname) - 1) {
-                qname[qname_idx++] = '.';
+            if (qname_idx > 0 && qname_idx < 63) {
+                state->qname[qname_idx & 0x3F] = '.';
+                qname_idx++;
             }
         } else {
-            if (qname_idx < sizeof(qname) - 1) {
-                qname[qname_idx++] = data[offset & 0xFF];
+            if (qname_idx < 63) {
+                state->qname[qname_idx & 0x3F] = data[state->offset & 0xFF];
+                qname_idx++;
             }
             label_len--;
         }
-        offset++;
+        state->offset++;
     }
 
-    log_info("dns [%llu]: pid=%u tid=%u qname=%s", ci->workload_id, ci->tgid, ci->tid, qname);
+    if (qname_idx < 64) {
+        state->qname[qname_idx & 0x3F] = '\0';
+    }
+
+    if (state->offset < read_len) {
+        u8 val = data[state->offset & 0xFF];
+        if (val == 0) {
+            state->offset++;
+        } else if ((val & 0xC0) == 0xC0) {
+            state->offset += 2;
+        }
+    }
+
+    state->offset += 4; // Skip QTYPE and QCLASS
+
+    bpf_tail_call(ctx, &jmp_table, 1);
+}
+
+static __always_inline void parse_dns_answers(struct msghdr *msg, struct conn_ident *ci) {
+    u8 iter_type = BPF_CORE_READ(msg, msg_iter.iter_type);
+    void *buf = NULL;
+    size_t len = 0;
+
+    if (iter_type == ITER_UBUF) {
+        buf = BPF_CORE_READ(msg, msg_iter.ubuf);
+        len = BPF_CORE_READ(msg, msg_iter.count);
+    } else if (iter_type == ITER_IOVEC) {
+        const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
+        buf = BPF_CORE_READ(iov, iov_base);
+        len = BPF_CORE_READ(iov, iov_len);
+    }
+
+    if (!buf || len < 12) return;
+
+    char data[MAX_DNS_READ];
+    size_t read_len = len;
+    if (read_len > MAX_DNS_READ) read_len = MAX_DNS_READ;
+    
+    if (bpf_probe_read_user(data, read_len & 0xFF, buf) < 0) {
+        return;
+    }
+
+    u32 key = 0;
+    struct dns_parse_state *state = bpf_map_lookup_elem(&dns_state_map, &key);
+    if (!state) return;
+
+    int offset = state->offset;
+    u16 ancount = state->ancount;
+
+    #pragma unroll
+    for (int ans = 0; ans < 4; ans++) {
+        if (ans >= ancount) break;
+        if (offset >= read_len) break;
+
+        if (offset < read_len) {
+            u8 val = data[offset & 0xFF];
+            if ((val & 0xC0) == 0xC0) {
+                offset += 2;
+            } else {
+                break;
+            }
+        }
+
+        if (offset + 10 > read_len) break;
+
+        u16 type = (data[offset & 0xFF] << 8) | data[(offset + 1) & 0xFF];
+        u16 class = (data[(offset + 2) & 0xFF] << 8) | data[(offset + 3) & 0xFF];
+        u16 rdlength = (data[(offset + 8) & 0xFF] << 8) | data[(offset + 9) & 0xFF];
+        offset += 10;
+
+        if (offset + rdlength > read_len) break;
+
+        if (type == 1 && class == 1 && rdlength == 4) { // A record
+            int safe_offset = offset & 0xFF;
+            if (safe_offset + 4 <= MAX_DNS_READ) {
+                u32 ip;
+                __builtin_memcpy(&ip, &data[safe_offset], 4);
+                log_info("dns [%llu]: pid=%u tid=%u qname=%s ip=%pI4", ci->workload_id, ci->tgid, ci->tid, state->qname, &ip);
+            }
+        } else if (type == 28 && class == 1 && rdlength == 16) { // AAAA record
+            int safe_offset = offset & 0xFF;
+            if (safe_offset + 16 <= MAX_DNS_READ) {
+                struct in6_addr ip6;
+                __builtin_memcpy(&ip6, &data[safe_offset], 16);
+                log_info("dns [%llu]: pid=%u tid=%u qname=%s ip=[%pI6]", ci->workload_id, ci->tgid, ci->tid, state->qname, &ip6);
+            }
+        }
+        
+        offset += rdlength;
+    }
 }
 
 SEC("fexit/udp_recvmsg")
@@ -477,7 +588,17 @@ int BPF_PROG(mon_parse_dns_qname, struct sock *sk, struct msghdr *msg)
     struct conn_ident *ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, 0);
     if (!ci) return 0;
     
-    parse_dns_qname(msg, ci);
+    parse_dns_qname(msg, ci, ctx);
+    return 0;
+}
+
+SEC("fexit/udp_recvmsg")
+int BPF_PROG(mon_parse_dns_answers, struct sock *sk, struct msghdr *msg)
+{
+    struct conn_ident *ci = bpf_sk_storage_get(&conn_ident_map, sk, NULL, 0);
+    if (!ci) return 0;
+    
+    parse_dns_answers(msg, ci);
     return 0;
 }
 
@@ -488,7 +609,7 @@ int BPF_PROG(mon_udp_recvmsg, struct sock *sk, struct msghdr *msg)
     if (!ci)
         return 0;
 
-    bpf_tail_call(ctx, &jmp_table, PROG_PARSE_DNS_QNAME);
+    bpf_tail_call(ctx, &jmp_table, 0);
     return 0;
 }
 
