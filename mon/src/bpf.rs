@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+use std::fs;
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{IterOpts, Link, MapCore, Object, OpenObject, ProgramAttachType, ProgramType};
 use tracing::info;
@@ -51,6 +54,64 @@ fn bpf_log_level(filter: LevelFilter) -> u32 {
     }
 }
 
+// Must match enum aidr_nameclass in bpf/mon_files.bpf.c.
+const NAMECLASSES: &[(&str, u8)] = &[
+    ("SRC", 1),
+    ("CFG", 2),
+    ("ENV", 3),
+    ("DB", 4),
+    ("BIN", 5),
+    ("MEDIA", 6),
+];
+
+/// Read the extension table for mon_files' `ext_classes`: a JSON object
+/// mapping each nameclass to its extensions (no dot), e.g.
+/// `{"SRC": ["py", "rs"], "CFG": ["toml"]}`. Returns the entries as
+/// NUL-padded keys, sorted bytewise, the order `nameclass_of` binary-searches
+/// in.
+fn read_ext_classes(path: &Path) -> Result<Vec<([u8; 8], u8)>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let groups: BTreeMap<String, Vec<String>> = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    let mut table = Vec::new();
+    for (class, exts) in &groups {
+        let Some(&(_, nc)) = NAMECLASSES.iter().find(|(name, _)| name == class) else {
+            bail!("{}: unknown nameclass {class:?}", path.display());
+        };
+        for ext in exts {
+            let ext = ext.to_ascii_lowercase();
+            // nameclass_of reads at most 8 characters and lowercases by
+            // OR-ing 0x20, which maps only letters and digits to themselves.
+            if ext.is_empty()
+                || ext.len() > 8
+                || !ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            {
+                bail!(
+                    "{}: {class}: bad extension {ext:?}: want 1-8 letters or digits, no dot",
+                    path.display()
+                );
+            }
+            let mut key = [0u8; 8];
+            key[..ext.len()].copy_from_slice(ext.as_bytes());
+            table.push((key, nc));
+        }
+    }
+
+    // [u8; 8] compares bytewise, as nameclass_of's big-endian words do.
+    table.sort_unstable();
+    if let Some(w) = table.windows(2).find(|w| w[0].0 == w[1].0) {
+        let ext = String::from_utf8_lossy(&w[0].0);
+        bail!(
+            "{}: extension {:?} listed more than once",
+            path.display(),
+            ext.trim_end_matches('\0')
+        );
+    }
+    Ok(table)
+}
+
 /// The skeletons borrow their OpenObject storage; leak it so they can live
 /// for the rest of the process.
 fn leak_storage() -> &'static mut MaybeUninit<OpenObject> {
@@ -85,8 +146,9 @@ fn attach_all(obj: &mut Object, links: &mut Vec<(String, Link)>) -> Result<()> {
     Ok(())
 }
 
-pub fn load(log_level: LevelFilter) -> Result<Bpf> {
+pub fn load(log_level: LevelFilter, ext_classes: &Path) -> Result<Bpf> {
     let level = bpf_log_level(log_level);
+    let ext_table = read_ext_classes(ext_classes)?;
 
     // mon_files owns tracked_pids: open and load.
     let mut open_files = MonFilesSkelBuilder::default()
@@ -96,6 +158,25 @@ pub fn load(log_level: LevelFilter) -> Result<Bpf> {
     // rodata is frozen at load, so the verifier prunes disabled log calls.
     if let Some(rodata) = open_files.maps.rodata_data.as_mut() {
         rodata.mon_log_level = level;
+
+        if ext_table.len() > rodata.ext_classes.len() {
+            bail!(
+                "{}: {} extensions, mon_files holds at most {}",
+                ext_classes.display(),
+                ext_table.len(),
+                rodata.ext_classes.len()
+            );
+        }
+        for (slot, (key, nc)) in rodata.ext_classes.iter_mut().zip(&ext_table) {
+            slot.ext = key.map(|b| b as i8);
+            slot.nc = *nc;
+        }
+        rodata.ext_classes_n = ext_table.len() as u32;
+        info!(
+            "loaded {} extension classes from {}",
+            ext_table.len(),
+            ext_classes.display()
+        );
     }
 
     let mut files = open_files.load().context("failed to load mon_files skeleton")?;

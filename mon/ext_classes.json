@@ -1,0 +1,8 @@
+{
+  "SRC": ["asm", "bash", "c", "cc", "cjs", "clj", "cpp", "cs", "cxx", "dart", "erl", "ex", "exs", "fish", "go", "h", "hh", "hpp", "hs", "hxx", "ipynb", "java", "jl", "js", "jsx", "kt", "kts", "lua", "m", "mjs", "ml", "mm", "php", "pl", "pm", "py", "pyi", "r", "rb", "rs", "s", "scala", "sh", "sql", "svelte", "swift", "ts", "tsx", "vue", "zsh"],
+  "CFG": ["cfg", "cnf", "conf", "config", "hcl", "ini", "json", "lock", "plist", "service", "tf", "toml", "xml", "yaml", "yml"],
+  "ENV": ["env", "gpg", "jks", "kdbx", "key", "netrc", "p12", "pem", "pfx", "pgpass"],
+  "DB": ["accdb", "db", "db3", "dbf", "frm", "ibd", "ldb", "mdb", "sqlite", "sqlite3"],
+  "BIN": ["a", "bin", "class", "deb", "dll", "dylib", "elf", "exe", "jar", "ko", "lib", "o", "obj", "out", "pyc", "pyo", "rpm", "so", "war", "wasm", "whl"],
+  "MEDIA": ["avi", "bmp", "flac", "gif", "ico", "jpeg", "jpg", "m4a", "mkv", "mov", "mp3", "mp4", "ogg", "pdf", "png", "svg", "tif", "tiff", "wav", "webm", "webp"]
+}

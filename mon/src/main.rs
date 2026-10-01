@@ -20,24 +20,35 @@ struct Args {
     /// Path to Unix domain socket for receiving commands
     #[arg(long = "socket-path", default_value = server::DEFAULT_SOCKET_PATH)]
     socket_path: PathBuf,
+
+    /// Extension to nameclass table for file codons [default: ext_classes.json
+    /// next to the mon binary]
+    #[arg(long = "ext-classes")]
+    ext_classes: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     let _log_guards = logger::init(&args.log)?;
 
-    run_daemon(&args.socket_path, args.log.level_filter()?)
+    let ext_classes = match args.ext_classes {
+        Some(path) => path,
+        None => std::env::current_exe()?.with_file_name("ext_classes.json"),
+    };
+
+    run_daemon(&args.socket_path, &ext_classes, args.log.level_filter()?)
 }
 
 fn run_daemon(
     socket_path: &Path,
+    ext_classes: &Path,
     log_level: tracing_subscriber::filter::LevelFilter,
 ) -> Result<()> {
     let shutdown = signals::init()?;
 
     info!("Starting...");
 
-    let mut bpf = bpf::load(log_level)?;
+    let mut bpf = bpf::load(log_level, ext_classes)?;
     let server = Server::bind(socket_path)?;
     info!(socket = %server.path().display(), "listening for commands");
 
