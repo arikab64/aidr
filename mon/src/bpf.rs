@@ -11,6 +11,7 @@ use libbpf_rs::{IterOpts, Link, MapCore, Object, OpenObject, ProgramAttachType, 
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 
+use crate::mon_file2_skel::{MonFile2Skel, MonFile2SkelBuilder};
 use crate::mon_files_skel::{MonFilesSkel, MonFilesSkelBuilder};
 use crate::mon_net_skel::{MonNetSkel, MonNetSkelBuilder};
 use crate::mon_procs_skel::{MonProcsSkel, MonProcsSkelBuilder};
@@ -27,6 +28,8 @@ pub struct Bpf {
     pub files: MonFilesSkel<'static>,
     pub procs: MonProcsSkel<'static>,
     pub net: MonNetSkel<'static>,
+    /// POC credential-file matcher; shares `task_ctx_map` like the others.
+    pub file2: MonFile2Skel<'static>,
     links: Vec<(String, Link)>,
     /// Link for the `mon_iter_task` iterator. Attached once; every
     /// `bpf_iter_create()` on it (see `tasks::run_iter`) runs a fresh pass.
@@ -110,6 +113,81 @@ fn read_ext_classes(path: &Path) -> Result<Vec<([u8; 8], u8)>> {
         );
     }
     Ok(table)
+}
+
+// Credential-file patterns for mon_file2 (POC). The rule id is the index.
+#[derive(Clone, Copy)]
+enum CredKind {
+    /// The path ends with the pattern, which starts with '/'.
+    Tail,
+    /// The pattern, which starts with '/', appears in the path.
+    Substr,
+    /// The filename ends with the pattern, which has no '/'.
+    NameSuffix,
+}
+
+const CRED_PATTERNS: &[(CredKind, &str)] = &[
+    (CredKind::Tail, "/.ssh/config"),
+    (CredKind::Substr, "/.ssh/"),
+    (CredKind::NameSuffix, "credentials"),
+    (CredKind::Substr, "/secrets/"),
+];
+
+// Must match MAX_PAT, NAME_MAX_REV and RULE_NAME in bpf/mon_file2.bpf.c.
+const CRED_MAX_PAT: usize = 128;
+const CRED_NAME_MAX_REV: usize = 64;
+const CRED_RULE_NAME: usize = 32;
+
+/// An LPM trie key: prefixlen in bits, then data zero-padded to cap bytes.
+fn lpm_key(data: &[u8], cap: usize) -> Vec<u8> {
+    let mut key = ((data.len() * 8) as u32).to_ne_bytes().to_vec();
+    key.extend_from_slice(data);
+    key.resize(4 + cap, 0);
+    key
+}
+
+/// Fill mon_file2's tries from CRED_PATTERNS; returns how many were loaded.
+fn load_cred_patterns(file2: &MonFile2Skel) -> Result<usize> {
+    for (id, &(kind, pat)) in CRED_PATTERNS.iter().enumerate() {
+        let bytes = pat.as_bytes();
+        if bytes.is_empty() || bytes.len() >= CRED_RULE_NAME || bytes.contains(&0) {
+            bail!("credential pattern {pat:?}: want 1-{} bytes, no NUL", CRED_RULE_NAME - 1);
+        }
+        let (map, key) = match kind {
+            CredKind::Tail | CredKind::Substr => {
+                if bytes[0] != b'/' {
+                    bail!("credential pattern {pat:?}: must start with '/'");
+                }
+                let mut data = bytes.to_vec();
+                if matches!(kind, CredKind::Tail) {
+                    data.push(0); // only matches at the path's NUL
+                }
+                if data.len() > CRED_MAX_PAT {
+                    bail!("credential pattern {pat:?}: longer than {CRED_MAX_PAT} bytes");
+                }
+                (&file2.maps.patterns, lpm_key(&data, CRED_MAX_PAT))
+            }
+            CredKind::NameSuffix => {
+                if bytes.contains(&b'/') || bytes.len() > CRED_NAME_MAX_REV {
+                    bail!(
+                        "credential pattern {pat:?}: want a name suffix of at most \
+                         {CRED_NAME_MAX_REV} bytes, no '/'"
+                    );
+                }
+                let rev: Vec<u8> = bytes.iter().rev().copied().collect();
+                (&file2.maps.name_suffix, lpm_key(&rev, CRED_NAME_MAX_REV))
+            }
+        };
+
+        // struct cred_rule: u32 id, then the NUL-padded name.
+        let mut value = (id as u32).to_ne_bytes().to_vec();
+        value.extend_from_slice(bytes);
+        value.resize(4 + CRED_RULE_NAME, 0);
+
+        map.update(&key, &value, libbpf_rs::MapFlags::ANY)
+            .with_context(|| format!("failed to insert credential pattern {pat:?}"))?;
+    }
+    Ok(CRED_PATTERNS.len())
 }
 
 /// The skeletons borrow their OpenObject storage; leak it so they can live
@@ -216,10 +294,32 @@ pub fn load(log_level: LevelFilter, ext_classes: &Path) -> Result<Bpf> {
 
     let mut net = open_net.load().context("failed to load mon_net skeleton")?;
 
+    // mon_file2 (POC) also declares task_ctx_map; share the same one.
+    let mut open_file2 = MonFile2SkelBuilder::default()
+        .open(leak_storage())
+        .context("failed to open mon_file2 skeleton")?;
+
+    if let Some(rodata) = open_file2.maps.rodata_data.as_mut() {
+        rodata.mon_log_level = level;
+    }
+
+    open_file2
+        .maps
+        .task_ctx_map
+        .reuse_fd(files.maps.task_ctx_map.as_fd())
+        .context("failed to share task_ctx_map with mon_file2")?;
+
+    let mut file2 = open_file2.load().context("failed to load mon_file2 skeleton")?;
+
+    // Patterns go in before the hook is attached.
+    let n = load_cred_patterns(&file2)?;
+    info!("loaded {n} credential patterns into mon_file2");
+
     let mut links = Vec::new();
     attach_all(files.object_mut(), &mut links)?;
     attach_all(procs.object_mut(), &mut links)?;
     attach_all(net.object_mut(), &mut links)?;
+    attach_all(file2.object_mut(), &mut links)?;
 
 
 
@@ -265,6 +365,7 @@ pub fn load(log_level: LevelFilter, ext_classes: &Path) -> Result<Bpf> {
         files,
         procs,
         net,
+        file2,
         links,
         task_iter,
         task_file_iter,

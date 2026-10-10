@@ -7,6 +7,9 @@ pub mod mon_procs_skel;
 #[path = "../../bpf/mon_net.skel.rs"]
 pub mod mon_net_skel;
 
+#[path = "../../bpf/mon_file2.skel.rs"]
+pub mod mon_file2_skel;
+
 pub mod bpf;
 pub mod logger;
 pub mod net;
