@@ -11,6 +11,7 @@ use libbpf_rs::{IterOpts, Link, MapCore, Object, OpenObject, ProgramAttachType, 
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 
+use crate::mon_dns_skel::{MonDnsSkel, MonDnsSkelBuilder};
 use crate::mon_file2_skel::{MonFile2Skel, MonFile2SkelBuilder};
 use crate::mon_files_skel::{MonFilesSkel, MonFilesSkelBuilder};
 use crate::mon_net_skel::{MonNetSkel, MonNetSkelBuilder};
@@ -30,6 +31,8 @@ pub struct Bpf {
     pub net: MonNetSkel<'static>,
     /// POC credential-file matcher; shares `task_ctx_map` like the others.
     pub file2: MonFile2Skel<'static>,
+    /// POC DNS rule matcher; shares `task_ctx_map` like the others.
+    pub dns: MonDnsSkel<'static>,
     links: Vec<(String, Link)>,
     /// Link for the `mon_iter_task` iterator. Attached once; every
     /// `bpf_iter_create()` on it (see `tasks::run_iter`) runs a fresh pass.
@@ -190,6 +193,57 @@ fn load_cred_patterns(file2: &MonFile2Skel) -> Result<usize> {
     Ok(CRED_PATTERNS.len())
 }
 
+// DNS rules for mon_dns (POC). The rule id is the index. "*.x" covers names
+// under x but not x itself.
+const DNS_RULES: &[&str] = &["example.com", "*.example.com", "*.github.com"];
+
+// Must match NAME_BUF, NAME_MAX_LEN and RULE_NAME in bpf/mon_dns.bpf.c.
+const DNS_NAME_BUF: usize = 256;
+const DNS_NAME_MAX_LEN: usize = 253;
+const DNS_RULE_NAME: usize = 64;
+
+/// The dns_rules trie key of a rule: the name lowercased and reversed. A
+/// wildcard keeps the '.' after its '*' ("*.a.com" -> "moc.a."), so it only
+/// matches names below a.com; an exact name gets a NUL, so it only matches
+/// itself.
+fn dns_rule_key(rule: &str) -> Result<Vec<u8>> {
+    let lower = rule.trim_end_matches('.').to_ascii_lowercase();
+    let (body, wildcard) = match lower.strip_prefix('*') {
+        Some(rest) => (rest, true),
+        None => (lower.as_str(), false),
+    };
+    if body.is_empty()
+        || body.len() > DNS_NAME_MAX_LEN
+        || (wildcard && !body.starts_with('.'))
+        || !body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+    {
+        bail!("DNS rule {rule:?}: want a name or \"*.\" + name, at most {DNS_NAME_MAX_LEN} bytes");
+    }
+    let mut data: Vec<u8> = body.bytes().rev().collect();
+    if !wildcard {
+        data.push(0);
+    }
+    Ok(lpm_key(&data, DNS_NAME_BUF))
+}
+
+/// Fill mon_dns's trie from DNS_RULES; returns how many were loaded.
+fn load_dns_rules(dns: &MonDnsSkel) -> Result<usize> {
+    for (id, rule) in DNS_RULES.iter().enumerate() {
+        let key = dns_rule_key(rule)?;
+
+        // struct dns_rule: u32 id, then the name, cut to keep its NUL.
+        let mut value = (id as u32).to_ne_bytes().to_vec();
+        value.extend_from_slice(&rule.as_bytes()[..rule.len().min(DNS_RULE_NAME - 1)]);
+        value.resize(4 + DNS_RULE_NAME, 0);
+
+        dns.maps
+            .dns_rules
+            .update(&key, &value, libbpf_rs::MapFlags::ANY)
+            .with_context(|| format!("failed to insert DNS rule {rule:?}"))?;
+    }
+    Ok(DNS_RULES.len())
+}
+
 /// The skeletons borrow their OpenObject storage; leak it so they can live
 /// for the rest of the process.
 fn leak_storage() -> &'static mut MaybeUninit<OpenObject> {
@@ -315,11 +369,33 @@ pub fn load(log_level: LevelFilter, ext_classes: &Path) -> Result<Bpf> {
     let n = load_cred_patterns(&file2)?;
     info!("loaded {n} credential patterns into mon_file2");
 
+    // mon_dns (POC) also declares task_ctx_map; share the same one.
+    let mut open_dns = MonDnsSkelBuilder::default()
+        .open(leak_storage())
+        .context("failed to open mon_dns skeleton")?;
+
+    if let Some(rodata) = open_dns.maps.rodata_data.as_mut() {
+        rodata.mon_log_level = level;
+    }
+
+    open_dns
+        .maps
+        .task_ctx_map
+        .reuse_fd(files.maps.task_ctx_map.as_fd())
+        .context("failed to share task_ctx_map with mon_dns")?;
+
+    let mut dns = open_dns.load().context("failed to load mon_dns skeleton")?;
+
+    // Rules go in before the hooks are attached.
+    let n = load_dns_rules(&dns)?;
+    info!("loaded {n} DNS rules into mon_dns");
+
     let mut links = Vec::new();
     attach_all(files.object_mut(), &mut links)?;
     attach_all(procs.object_mut(), &mut links)?;
     attach_all(net.object_mut(), &mut links)?;
     attach_all(file2.object_mut(), &mut links)?;
+    attach_all(dns.object_mut(), &mut links)?;
 
 
 
@@ -366,6 +442,7 @@ pub fn load(log_level: LevelFilter, ext_classes: &Path) -> Result<Bpf> {
         procs,
         net,
         file2,
+        dns,
         links,
         task_iter,
         task_file_iter,

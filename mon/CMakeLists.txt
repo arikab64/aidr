@@ -28,6 +28,8 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/bpf/mon_files.skel.rs
             ${CMAKE_SOURCE_DIR}/bpf/mon_procs.skel.rs
             ${CMAKE_SOURCE_DIR}/bpf/mon_net.skel.rs
+            ${CMAKE_SOURCE_DIR}/bpf/mon_file2.skel.rs
+            ${CMAKE_SOURCE_DIR}/bpf/mon_dns.skel.rs
     COMMENT "CARGO ${MON_BIN}"
     VERBATIM
 )

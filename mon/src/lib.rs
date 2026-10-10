@@ -10,6 +10,9 @@ pub mod mon_net_skel;
 #[path = "../../bpf/mon_file2.skel.rs"]
 pub mod mon_file2_skel;
 
+#[path = "../../bpf/mon_dns.skel.rs"]
+pub mod mon_dns_skel;
+
 pub mod bpf;
 pub mod logger;
 pub mod net;
